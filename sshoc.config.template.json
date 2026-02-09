@@ -1,0 +1,22 @@
+{
+  "$schema": "./sshoc.config.schema.json",
+  "schema_version": 1,
+  "defaults": {
+    "connect_timeout_sec": 10,
+    "command_timeout_sec": 120,
+    "max_stdout_bytes": 10485760,
+    "max_stderr_bytes": 10485760,
+    "known_hosts_policy": "strict",
+    "known_hosts_path": "~/.ssh/known_hosts",
+    "default_shell": "bash -lc"
+  },
+  "servers": {
+    "demo": {
+      "ssh_command": "ssh -p 22 user@your-host",
+      "auth": {
+        "type": "password",
+        "password_env": "SSHOC_DEMO_PASSWORD"
+      }
+    }
+  }
+}

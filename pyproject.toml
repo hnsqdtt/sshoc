@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling>=1.22.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sshoc"
+version = "0.1.0"
+description = "Lightweight SSH toolkit with optional MCP(stdio) JSON-RPC adapter"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+classifiers = [
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+]
+dependencies = [
+  "paramiko>=3.4.0",
+]
+
+[project.scripts]
+sshoc = "sshoc.cli:main"
+sshoc-mcp = "sshoc.mcp_server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sshoc"]
