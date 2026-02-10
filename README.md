@@ -2,12 +2,13 @@
 
 简体中文 | [English](README.en.md)
 
-一个轻量、配置驱动的 SSH 工具集合（CLI + 可选 MCP stdio 适配）。用 `json` 配置多台服务器，然后通过：
+一个轻量、配置驱动的 SSH 工具集合（CLI + 可选 MCP(stdio) 适配）。
 
-- **CLI 前缀命令**：`sshoc <profile>: <command...>`（快速执行远端命令）
-- **MCP(stdio) 服务**：对外暴露 `tools/list` / `tools/call`，让支持 MCP 的客户端直接调用 `ssh.run` / `ssh.upload` / `ssh.download`
+- **CLI**：`sshoc`（`list/run/upload/download/hostkey/...`，以及前缀形式 `sshoc <profile>: <command...>`）
+- **MCP(stdio)**：`sshoc-mcp`（按行 JSON 的 JSON-RPC，暴露 `ssh.*` 工具给 MCP 客户端）
+- **依赖**：`paramiko`（SSH/SFTP）
 
-> 依赖：`paramiko`（SSH/SFTP）。
+> 目标：严格、可预测、易嵌入（尤其适合自动化/AI 场景）。
 
 ---
 
@@ -19,17 +20,17 @@
 python -m pip install -U sshoc
 ```
 
-2) 初始化配置（写入用户配置目录，推荐）：
+2) 初始化配置（推荐写入用户配置目录）：
 
 ```bash
-# Password auth（推荐用环境变量保存密码）
+# 密码认证（推荐用环境变量保存密码）
 sshoc init demo --ssh "ssh -p 22 user@host" --password-env SSHOC_DEMO_PASSWORD
 
-# 或 Key auth
+# 或：Key 认证
 sshoc init demo --ssh "ssh -p 22 user@host" --key-path ~/.ssh/id_ed25519
 ```
 
-3) 设置密码环境变量（仅 password_env 方式需要）：
+3) 设置密码环境变量（仅 `password_env` 方式需要）：
 
 ```powershell
 $env:SSHOC_DEMO_PASSWORD="your_password"
@@ -39,26 +40,29 @@ $env:SSHOC_DEMO_PASSWORD="your_password"
 export SSHOC_DEMO_PASSWORD="your_password"
 ```
 
-4) 使用：
+4) 首次连接（known_hosts）：
+
+默认 `known_hosts_policy=strict`，若本机 `known_hosts` 里没有目标主机的 host key，连接会失败。推荐先写入 host key（可选校验指纹）：
 
 ```bash
-sshoc list
+sshoc hostkey ensure demo
+# 如果你能从云厂商/运维渠道拿到可信指纹，强烈建议加这一行：
+# sshoc hostkey ensure demo --expected-fingerprint "SHA256:..."
+```
+
+5) 执行命令：
+
+```bash
 sshoc demo: uname -a
+# 或
+sshoc run demo --cmd "uname -a"
 ```
 
 ---
 
-## 安装
+## 安装（开发者）
 
-### 方式 A：从 PyPI 安装（推荐）
-
-```bash
-python -m pip install -U sshoc
-```
-
-### 方式 B：从源码安装（开发）
-
-建议在本目录单独建虚拟环境（也可用你习惯的方式）：
+从源码安装（建议在本目录单独建虚拟环境）：
 
 ```bash
 cd "SSH_Operation_Component (MCP)"
@@ -72,47 +76,13 @@ python -m pip install -e .
 
 ## 配置
 
-### 1) 生成配置（`sshoc init`）
-
-```bash
-# 写入到用户配置目录（推荐）
-sshoc init
-
-# 或写入到当前目录 ./sshoc.config.json
-sshoc init --local
-
-# 或写入到任意路径
-sshoc init --output /path/to/sshoc.config.json
-```
-
-说明：
-
-- `sshoc init`（无 `<profile>`）会写入**完整模板**（包含 demo profile）。
-- `sshoc init <profile> --ssh ... --password-env/--password/--key-path ...` 会写入**单 profile 配置**（更适合 pip 用户快速上手）。
-
-### 2) 配置文件在哪里？（以及我现在用的是哪一份？）
-
-用这条命令查看当前会读取哪份配置：
+### 配置文件在哪里？（以及当前生效的是哪一份？）
 
 ```bash
 sshoc config path
 ```
 
-它会输出：
-
-- `path`：配置文件路径
-- `source`：来源（`cli|env|cwd|user|package`）
-- `exists`：该路径是否存在
-
-用户配置目录默认位置：
-
-- Windows：`%APPDATA%\\sshoc\\sshoc.config.json`
-- macOS：`~/Library/Application Support/sshoc/sshoc.config.json`
-- Linux：`~/.config/sshoc/sshoc.config.json`（或 `$XDG_CONFIG_HOME/sshoc/sshoc.config.json`）
-
-### 3) 工程化建议：用 `SSHOC_CONFIG` 固定配置路径
-
-如果你希望“在任何目录运行都读取同一份配置”，建议设置环境变量 `SSHOC_CONFIG`：
+### 工程化建议：用 `SSHOC_CONFIG` 固定配置路径
 
 ```powershell
 $env:SSHOC_CONFIG="C:\\path\\to\\sshoc.config.json"
@@ -122,88 +92,59 @@ $env:SSHOC_CONFIG="C:\\path\\to\\sshoc.config.json"
 export SSHOC_CONFIG="/path/to/sshoc.config.json"
 ```
 
-### 4)（可选）在仓库里开发：复制模板文件
+### 关键字段速览
 
-如果你是在仓库里开发，也可以直接把模板复制为 `sshoc.config.json`（模板包含 `$schema` 指向 `sshoc.config.schema.json`，方便 IDE 做字段提示；解析时也允许该字段存在）：
-
-```bash
-# macOS / Linux
-cp sshoc.config.template.json sshoc.config.json
-```
-
-```powershell
-# Windows PowerShell / CMD
-copy sshoc.config.template.json sshoc.config.json
-# 或：
-Copy-Item sshoc.config.template.json sshoc.config.json
-```
-
-然后设置密码（推荐用环境变量，避免把密码明文写进 git）：
-
-```powershell
-$env:SSHOC_DEMO_PASSWORD="your_password"
-```
-
-### 配置字段要点
-
-- `servers.<profile>`：你自定义的 profile 名称（建议 `a-zA-Z0-9_-`）
-- `servers.<profile>.ssh_command`：支持常见形式 `ssh -p <port> user@host`（高级 ssh 参数请改用显式字段/功能扩展）
+- `servers.<profile>`：profile 名称（推荐 `A-Za-z0-9_-`）
+- `servers.<profile>.ssh_command`：常见形式 `ssh -p <port> user@host`
 - `auth.type`：
-  - `password`：支持 `password` 或 `password_env`
-  - `key`：支持 `private_key_path`（可选 `private_key_passphrase_env`）
+  - `password`：`password` 或 `password_env`
+  - `key`：`private_key_path`（可选 `private_key_passphrase_env`）
 - `known_hosts_policy`：
-  - `strict`：默认，未知 host key 直接报错（更安全）
-  - `accept_new`：首次连接自动写入 `known_hosts_path`
-- `default_shell`：可选，常用 `bash -lc`（更接近交互环境）；若远端无 bash 可设为 `null`
+  - `strict`：默认；未知 host key 直接报错（更安全）
+  - `accept_new`：首次连接自动写入 `known_hosts_path`（TOFU）
+- `known_hosts_path`：OpenSSH `known_hosts` 路径（模板默认：`~/.ssh/known_hosts`）
+- `default_shell`：默认 `bash -lc`（远端无 bash 可设为 `null`）
 
 ---
 
-## CLI 使用（前缀命令）
+## CLI
 
-列出配置里的所有 profile：
+### 常用命令
 
 ```bash
 sshoc list
-```
-
-### Profile 管理（编辑配置文件）
-
-> 这些命令会直接修改当前生效的配置文件。建议先用 `sshoc config path` 确认路径；也可以通过 `--config <path>` 显式指定。
-
-```bash
-# 删除某个 profile
-sshoc profile remove demo
-
-# 清空所有 profiles（把 servers 置为空对象）
-sshoc profile clear
-```
-
-执行远端命令（推荐的“前缀”形式）：
-
-```bash
-sshoc demo: uname -a
 sshoc demo: "ls -la /root"
-```
-
-显式子命令形式（便于参数化）：
-
-```bash
 sshoc run demo --cmd "python -V"
 sshoc upload demo --local ./local.txt --remote /tmp/local.txt --overwrite
 sshoc download demo --remote /tmp/local.txt --local ./downloaded.txt --overwrite
 ```
 
-默认配置文件查找顺序：
+### host key / known_hosts
 
-1. `--config <path>`
-2. 环境变量 `SSHOC_CONFIG`
-3. 当前目录 `./sshoc.config.json`
-4. 用户配置目录（Windows: `%APPDATA%\\sshoc\\sshoc.config.json`；Linux: `~/.config/sshoc/sshoc.config.json`）
-5. 包/源码目录内 `sshoc.config.json`（开发兜底）
+这些命令输出 JSON，适合脚本/CI/自动化。
+
+```bash
+# 扫描远端 host key（不需要登录）
+sshoc hostkey scan demo
+
+# 检查本机 known_hosts 是否已有该 host
+sshoc hostkey is-known demo
+
+# 扫描并写入 known_hosts（可选：校验指纹）
+sshoc hostkey ensure demo
+sshoc hostkey ensure demo --expected-fingerprint "SHA256:..."
+
+# 手动写入（你已拿到 key_type + base64）
+sshoc hostkey add demo --key-type ssh-ed25519 --public-key-base64 "<BASE64>"
+
+# 精准删除：只删某个 key_type，或删除该 host 的所有 key types
+sshoc hostkey remove demo --key-type ssh-ed25519
+sshoc hostkey remove demo --all-types
+```
 
 ---
 
-## MCP(stdio) server 使用
+## MCP(stdio) server
 
 启动：
 
@@ -211,18 +152,20 @@ sshoc download demo --remote /tmp/local.txt --local ./downloaded.txt --overwrite
 sshoc-mcp
 ```
 
-它会在 `stdin/stdout` 上用**按行 JSON**的方式收发 JSON-RPC（对齐 MCP 的 stdio transport 习惯）。
-
 提供的工具：
 
 - `ssh.list_profiles`
+- `ssh.scan_host_key`
+- `ssh.is_known_host`
+- `ssh.add_known_host`
+- `ssh.ensure_known_host`
 - `ssh.run`
 - `ssh.upload`
 - `ssh.download`
 
 ### 通用 stdio 配置蓝图（供 MCP 客户端参考）
 
-不同 MCP 客户端的配置文件格式可能不同，但核心都离不开：`command` / `args` / `env` / `cwd`。下面给一个“通用蓝图”示例（字段名仅供参考，请按你的客户端实际格式填入）：
+不同 MCP 客户端配置格式可能不同，但核心都离不开：`command` / `args` / `env` / `cwd`。下面给一个“通用蓝图”示例（字段名仅供参考，请按你的客户端实际格式填入）：
 
 ```jsonc
 {
@@ -243,21 +186,16 @@ sshoc-mcp
 // - Windows: C:\\path\\to\\sshoc.config.json
 ```
 
-两个常见变体（按需选择其一）：
-
-- 如果你的客户端不方便传 `args`：用环境变量 `SSHOC_CONFIG` 固定配置路径（并继续在 `env` 注入 `password_env` 对应的密码变量）。
-- 如果 `sshoc-mcp` 不在 PATH：改用 venv 的 `python -m sshoc.mcp_server --config <ABS_CONFIG_PATH>` 启动。
-
 ---
 
 ## 安全提示（强烈建议）
 
-- 不要把云服务器密码明文提交到仓库。优先使用 `password_env`。
-- 这个组件等价于“给 AI 一个远程执行入口”，请只在你信任的环境里使用。
+- 不要把服务器密码明文提交到仓库：优先 `password_env`
+- `accept_new` 属于 TOFU（首次信任）；更安全的做法是使用 `--expected-fingerprint` 校验
+- 这个组件等价于“给自动化/AI 一个远程执行入口”，请只在你信任的环境里使用
 
 ---
 
 ## License
 
-Apache-2.0（见 `LICENSE`）。
-
+Apache-2.0（见 `LICENSE`）

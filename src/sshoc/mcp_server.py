@@ -5,8 +5,18 @@ import os
 import sys
 from typing import Any
 
+import paramiko
+
 from . import __version__
 from .config import load_config, resolve_default_config_path
+from .host_keys import (
+    HostKeyInfo,
+    add_known_host,
+    ensure_known_host,
+    format_host_id,
+    known_hosts_entries,
+    scan_host_key,
+)
 from .jsonrpc import (
     JSONRPCInvalidRequest,
     JSONRPCParseError,
@@ -22,6 +32,31 @@ LATEST_PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS: list[str] = ["2024-11-05", "2025-03-26", "2025-06-18", LATEST_PROTOCOL_VERSION]
 
 
+def _tool_error(
+    *,
+    code: str,
+    message: str,
+    details: dict[str, Any] | None = None,
+    suggested_fixes: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    err: dict[str, Any] = {"code": code, "message": message}
+    if details:
+        err["details"] = details
+    if suggested_fixes:
+        err["suggestedFixes"] = suggested_fixes
+    structured = {"error": err}
+    return {
+        "content": _result_text_block(json.dumps(structured, ensure_ascii=False, indent=2)),
+        "structuredContent": structured,
+        "isError": True,
+    }
+
+
+def _server_from_profile(cfg, profile: str) -> tuple[str, int, str | None]:
+    srv = cfg.get_server(profile)
+    return srv.host, srv.port, srv.proxy_command
+
+
 def _tool_list() -> list[dict[str, Any]]:
     return [
         {
@@ -29,6 +64,88 @@ def _tool_list() -> list[dict[str, Any]]:
             "description": "List server profiles configured in sshoc.config.json",
             "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}},
             "annotations": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True},
+        },
+        {
+            "name": "ssh.scan_host_key",
+            "description": "Scan remote SSH host key (no auth) and return fingerprints / known_hosts line",
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "profile": {"type": "string", "description": "Use host/port from a configured profile"},
+                    "host": {"type": "string"},
+                    "port": {"type": "integer"},
+                    "proxy_command": {"type": "string"},
+                    "timeout_sec": {"type": "number"},
+                },
+            },
+            "outputSchema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["host_key"],
+                "properties": {
+                    "profile": {"type": "string"},
+                    "host_key": {
+                        "type": "object",
+                        "additionalProperties": True,
+                    },
+                },
+            },
+            "annotations": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True},
+        },
+        {
+            "name": "ssh.is_known_host",
+            "description": "Check whether a host key exists in known_hosts_path for a profile/host",
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "profile": {"type": "string"},
+                    "host": {"type": "string"},
+                    "port": {"type": "integer"},
+                    "known_hosts_path": {"type": ["string", "null"]},
+                },
+            },
+            "annotations": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True},
+        },
+        {
+            "name": "ssh.add_known_host",
+            "description": "Add a host key entry to known_hosts_path",
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["known_hosts_path", "key_type", "public_key_base64"],
+                "properties": {
+                    "profile": {"type": "string"},
+                    "host": {"type": "string"},
+                    "port": {"type": "integer"},
+                    "known_hosts_path": {"type": "string"},
+                    "key_type": {"type": "string"},
+                    "public_key_base64": {"type": "string"},
+                    "overwrite": {"type": "boolean"},
+                },
+            },
+            "annotations": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True},
+        },
+        {
+            "name": "ssh.ensure_known_host",
+            "description": "Scan and (optionally) write the remote host key into known_hosts_path",
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["known_hosts_path"],
+                "properties": {
+                    "profile": {"type": "string"},
+                    "host": {"type": "string"},
+                    "port": {"type": "integer"},
+                    "proxy_command": {"type": "string"},
+                    "timeout_sec": {"type": "number"},
+                    "known_hosts_path": {"type": "string"},
+                    "expected_host_key_fingerprint": {"type": "string"},
+                    "overwrite": {"type": "boolean"},
+                },
+            },
+            "annotations": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True},
         },
         {
             "name": "ssh.run",
@@ -44,6 +161,9 @@ def _tool_list() -> list[dict[str, Any]]:
                     "cwd": {"type": "string"},
                     "env": {"type": "object", "additionalProperties": {"type": "string"}},
                     "use_pty": {"type": "boolean"},
+                    "known_hosts_policy": {"type": "string", "enum": ["strict", "accept_new"]},
+                    "known_hosts_path": {"type": ["string", "null"]},
+                    "expected_host_key_fingerprint": {"type": "string"},
                 },
             },
             "outputSchema": {
@@ -57,6 +177,9 @@ def _tool_list() -> list[dict[str, Any]]:
                     "stdout": {"type": "string"},
                     "stderr": {"type": "string"},
                     "duration_ms": {"type": "integer"},
+                    "host_key": {"type": "object"},
+                    "host_key_added": {"type": "boolean"},
+                    "known_hosts_path": {"type": ["string", "null"]},
                 },
             },
             "annotations": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True},
@@ -73,6 +196,9 @@ def _tool_list() -> list[dict[str, Any]]:
                     "local_path": {"type": "string"},
                     "remote_path": {"type": "string"},
                     "overwrite": {"type": "boolean"},
+                    "known_hosts_policy": {"type": "string", "enum": ["strict", "accept_new"]},
+                    "known_hosts_path": {"type": ["string", "null"]},
+                    "expected_host_key_fingerprint": {"type": "string"},
                 },
             },
             "annotations": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True},
@@ -89,6 +215,9 @@ def _tool_list() -> list[dict[str, Any]]:
                     "remote_path": {"type": "string"},
                     "local_path": {"type": "string"},
                     "overwrite": {"type": "boolean"},
+                    "known_hosts_policy": {"type": "string", "enum": ["strict", "accept_new"]},
+                    "known_hosts_path": {"type": ["string", "null"]},
+                    "expected_host_key_fingerprint": {"type": "string"},
                 },
             },
             "annotations": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True},
@@ -115,6 +244,217 @@ def _call_tool(cfg_path: str, *, tool_name: str, args: dict[str, Any] | None) ->
             "isError": False,
         }
 
+    if tool_name == "ssh.scan_host_key":
+        profile = args.get("profile")
+        host = args.get("host")
+        port = args.get("port")
+        proxy_command = args.get("proxy_command")
+        timeout_sec = args.get("timeout_sec", 10.0)
+
+        if profile is not None:
+            if not isinstance(profile, str):
+                raise ValueError("profile must be a string")
+            host, port, profile_proxy = _server_from_profile(cfg, profile)
+            if proxy_command is None:
+                proxy_command = profile_proxy
+        else:
+            if not isinstance(host, str) or not host:
+                raise ValueError("ssh.scan_host_key requires 'profile' or 'host'")
+            if port is None:
+                port = 22
+        if not isinstance(port, int):
+            raise ValueError("port must be an integer")
+        if proxy_command is not None and not isinstance(proxy_command, str):
+            raise ValueError("proxy_command must be a string")
+        if timeout_sec is not None and not isinstance(timeout_sec, (int, float)):
+            raise ValueError("timeout_sec must be a number")
+
+        try:
+            info, _key = scan_host_key(host, port, proxy_command=proxy_command, timeout_sec=timeout_sec)
+        except Exception as exc:
+            return _tool_error(
+                code="HOST_KEY_SCAN_FAILED",
+                message=f"{type(exc).__name__}: {exc}",
+                details={"profile": profile, "host": host, "port": port},
+            )
+
+        structured: dict[str, Any] = {"host_key": info.to_dict()}
+        if isinstance(profile, str):
+            structured["profile"] = profile
+        return {
+            "content": _result_text_block(json.dumps(structured, ensure_ascii=False, indent=2)),
+            "structuredContent": structured,
+            "isError": False,
+        }
+
+    if tool_name == "ssh.is_known_host":
+        profile = args.get("profile")
+        host = args.get("host")
+        port = args.get("port")
+        known_hosts_path = args["known_hosts_path"] if "known_hosts_path" in args else cfg.defaults.known_hosts_path
+
+        if profile is not None:
+            if not isinstance(profile, str):
+                raise ValueError("profile must be a string")
+            host, port, _proxy = _server_from_profile(cfg, profile)
+        else:
+            if not isinstance(host, str) or not host:
+                raise ValueError("ssh.is_known_host requires 'profile' or 'host'")
+            if port is None:
+                port = 22
+        if not isinstance(port, int):
+            raise ValueError("port must be an integer")
+        if known_hosts_path is not None and not isinstance(known_hosts_path, str):
+            raise ValueError("known_hosts_path must be string or null")
+
+        if known_hosts_path is None:
+            return _tool_error(
+                code="KNOWN_HOSTS_PATH_NULL",
+                message="known_hosts_path is null; cannot inspect known_hosts (set defaults.known_hosts_path or pass known_hosts_path)",
+                details={"profile": profile, "host": host, "port": port},
+            )
+
+        entries = known_hosts_entries(known_hosts_path=known_hosts_path, host=host, port=port)
+        structured = {
+            "known": bool(entries),
+            "known_hosts_path": known_hosts_path,
+            "host_id": format_host_id(host, port),
+            "entries": [e.to_dict() for e in entries],
+        }
+        if isinstance(profile, str):
+            structured["profile"] = profile
+        return {
+            "content": _result_text_block(json.dumps(structured, ensure_ascii=False, indent=2)),
+            "structuredContent": structured,
+            "isError": False,
+        }
+
+    if tool_name == "ssh.add_known_host":
+        profile = args.get("profile")
+        host = args.get("host")
+        port = args.get("port")
+        known_hosts_path = args.get("known_hosts_path")
+        key_type = args.get("key_type")
+        public_key_base64 = args.get("public_key_base64")
+        overwrite = args.get("overwrite", False)
+
+        if not isinstance(known_hosts_path, str) or not known_hosts_path:
+            raise ValueError("known_hosts_path must be a non-empty string")
+        if profile is not None:
+            if not isinstance(profile, str):
+                raise ValueError("profile must be a string")
+            host, port, _proxy = _server_from_profile(cfg, profile)
+        else:
+            if not isinstance(host, str) or not host:
+                raise ValueError("ssh.add_known_host requires 'profile' or 'host'")
+            if port is None:
+                port = 22
+        if not isinstance(port, int):
+            raise ValueError("port must be an integer")
+        if not isinstance(key_type, str) or not isinstance(public_key_base64, str):
+            raise ValueError("key_type/public_key_base64 must be strings")
+        if not isinstance(overwrite, bool):
+            raise ValueError("overwrite must be a boolean")
+
+        try:
+            structured = add_known_host(
+                known_hosts_path=known_hosts_path,
+                host=host,
+                port=port,
+                key_type=key_type,
+                public_key_base64=public_key_base64,
+                overwrite=overwrite,
+            )
+            if isinstance(profile, str):
+                structured["profile"] = profile
+        except Exception as exc:
+            return _tool_error(
+                code="KNOWN_HOST_ADD_FAILED",
+                message=f"{type(exc).__name__}: {exc}",
+                details={"profile": profile, "host": host, "port": port, "known_hosts_path": known_hosts_path},
+            )
+
+        return {
+            "content": _result_text_block(json.dumps(structured, ensure_ascii=False, indent=2)),
+            "structuredContent": structured,
+            "isError": False,
+        }
+
+    if tool_name == "ssh.ensure_known_host":
+        profile = args.get("profile")
+        host = args.get("host")
+        port = args.get("port")
+        proxy_command = args.get("proxy_command")
+        timeout_sec = args.get("timeout_sec", 10.0)
+        known_hosts_path = args.get("known_hosts_path")
+        expected_host_key_fingerprint = args.get("expected_host_key_fingerprint")
+        overwrite = args.get("overwrite", False)
+
+        if not isinstance(known_hosts_path, str) or not known_hosts_path:
+            raise ValueError("known_hosts_path must be a non-empty string")
+        if profile is not None:
+            if not isinstance(profile, str):
+                raise ValueError("profile must be a string")
+            host, port, profile_proxy = _server_from_profile(cfg, profile)
+            if proxy_command is None:
+                proxy_command = profile_proxy
+        else:
+            if not isinstance(host, str) or not host:
+                raise ValueError("ssh.ensure_known_host requires 'profile' or 'host'")
+            if port is None:
+                port = 22
+        if not isinstance(port, int):
+            raise ValueError("port must be an integer")
+        if proxy_command is not None and not isinstance(proxy_command, str):
+            raise ValueError("proxy_command must be a string")
+        if timeout_sec is not None and not isinstance(timeout_sec, (int, float)):
+            raise ValueError("timeout_sec must be a number")
+        if expected_host_key_fingerprint is not None and not isinstance(expected_host_key_fingerprint, str):
+            raise ValueError("expected_host_key_fingerprint must be a string")
+        if not isinstance(overwrite, bool):
+            raise ValueError("overwrite must be a boolean")
+
+        try:
+            structured = ensure_known_host(
+                known_hosts_path=known_hosts_path,
+                host=host,
+                port=port,
+                proxy_command=proxy_command,
+                timeout_sec=timeout_sec,
+                expected_host_key_fingerprint=expected_host_key_fingerprint,
+                overwrite=overwrite,
+            )
+            if isinstance(profile, str):
+                structured["profile"] = profile
+        except Exception as exc:
+            fixes: list[dict[str, Any]] = []
+            if expected_host_key_fingerprint is not None:
+                fixes.append(
+                    {
+                        "tool": "ssh.scan_host_key",
+                        "arguments": {"profile": profile} if isinstance(profile, str) else {"host": host, "port": port},
+                        "note": "Inspect remote host key and verify expected fingerprint/source.",
+                    }
+                )
+            return _tool_error(
+                code="ENSURE_KNOWN_HOST_FAILED",
+                message=f"{type(exc).__name__}: {exc}",
+                details={
+                    "profile": profile,
+                    "host": host,
+                    "port": port,
+                    "known_hosts_path": known_hosts_path,
+                    "host_id": format_host_id(host, port),
+                },
+                suggested_fixes=fixes or None,
+            )
+
+        return {
+            "content": _result_text_block(json.dumps(structured, ensure_ascii=False, indent=2)),
+            "structuredContent": structured,
+            "isError": False,
+        }
+
     if tool_name == "ssh.run":
         profile = args.get("profile")
         command = args.get("command")
@@ -124,6 +464,10 @@ def _call_tool(cfg_path: str, *, tool_name: str, args: dict[str, Any] | None) ->
         cwd = args.get("cwd")
         env = args.get("env")
         use_pty = args.get("use_pty", False)
+        known_hosts_policy = args.get("known_hosts_policy")
+        known_hosts_path = args.get("known_hosts_path") if "known_hosts_path" in args else None
+        has_known_hosts_path_override = "known_hosts_path" in args
+        expected_host_key_fingerprint = args.get("expected_host_key_fingerprint")
 
         if timeout_sec is not None and not isinstance(timeout_sec, (int, float)):
             raise ValueError("timeout_sec must be a number")
@@ -135,16 +479,102 @@ def _call_tool(cfg_path: str, *, tool_name: str, args: dict[str, Any] | None) ->
             raise ValueError("env must be an object of string->string")
         if not isinstance(use_pty, bool):
             raise ValueError("use_pty must be a boolean")
+        if known_hosts_policy is not None and not isinstance(known_hosts_policy, str):
+            raise ValueError("known_hosts_policy must be a string")
+        if has_known_hosts_path_override and known_hosts_path is not None and not isinstance(known_hosts_path, str):
+            raise ValueError("known_hosts_path must be a string or null")
+        if expected_host_key_fingerprint is not None and not isinstance(expected_host_key_fingerprint, str):
+            raise ValueError("expected_host_key_fingerprint must be a string")
 
         client = build_client(cfg, profile)
-        rr = client.run(
-            command,
-            timeout_sec=float(timeout_sec) if timeout_sec is not None else None,
-            cwd=cwd,
-            env=env,
-            use_pty=use_pty,
-        )
-        structured = rr.to_dict()
+        run_kwargs: dict[str, Any] = {
+            "timeout_sec": float(timeout_sec) if timeout_sec is not None else None,
+            "cwd": cwd,
+            "env": env,
+            "use_pty": use_pty,
+            "report_host_key": True,
+        }
+        if known_hosts_policy is not None:
+            run_kwargs["known_hosts_policy"] = known_hosts_policy
+        if has_known_hosts_path_override:
+            run_kwargs["known_hosts_path"] = known_hosts_path
+        if expected_host_key_fingerprint is not None:
+            run_kwargs["expected_host_key_fingerprint"] = expected_host_key_fingerprint
+
+        try:
+            rr = client.run(command, **run_kwargs)
+            structured = rr.to_dict()
+        except paramiko.ssh_exception.BadHostKeyException as exc:
+            host, port, _proxy = _server_from_profile(cfg, profile)
+            expected = HostKeyInfo.from_key(host=host, port=port, key=exc.expected_key).to_dict()
+            got = HostKeyInfo.from_key(host=host, port=port, key=exc.key).to_dict()
+            return _tool_error(
+                code="KNOWN_HOST_CHANGED",
+                message=str(exc),
+                details={"profile": profile, "expected": expected, "got": got},
+            )
+        except paramiko.ssh_exception.SSHException as exc:
+            msg = str(exc)
+            if "not found in known_hosts" in msg:
+                host, port, _proxy = _server_from_profile(cfg, profile)
+                kh_path = (
+                    known_hosts_path
+                    if has_known_hosts_path_override
+                    else cfg.defaults.known_hosts_path
+                )
+                ensure_args: dict[str, Any] = {
+                    "profile": profile,
+                    "known_hosts_path": kh_path or "~/.ssh/known_hosts",
+                }
+                if expected_host_key_fingerprint is not None:
+                    ensure_args["expected_host_key_fingerprint"] = expected_host_key_fingerprint
+                fixes = [
+                    {
+                        "tool": "ssh.ensure_known_host",
+                        "arguments": ensure_args,
+                        "note": "Prefer: scan+write known_hosts, optionally verify fingerprint from a trusted source.",
+                    },
+                    {
+                        "tool": "ssh.run",
+                        "arguments": {
+                            "profile": profile,
+                            "command": command,
+                            "known_hosts_policy": "accept_new",
+                        },
+                        "note": "Quick TOFU: accept & save new host key (less safe).",
+                    },
+                ]
+                return _tool_error(
+                    code="KNOWN_HOST_MISSING",
+                    message=msg,
+                    details={
+                        "profile": profile,
+                        "host": host,
+                        "port": port,
+                        "host_id": format_host_id(host, port),
+                        "known_hosts_path": kh_path,
+                        "known_hosts_policy": known_hosts_policy or cfg.defaults.known_hosts_policy,
+                    },
+                    suggested_fixes=fixes,
+                )
+            if "host key fingerprint mismatch" in msg:
+                fixes = [
+                    {
+                        "tool": "ssh.scan_host_key",
+                        "arguments": {"profile": profile},
+                        "note": "Inspect the remote host key and compare with the expected fingerprint source.",
+                    }
+                ]
+                return _tool_error(
+                    code="HOST_KEY_FINGERPRINT_MISMATCH",
+                    message=msg,
+                    details={"profile": profile, "expected_host_key_fingerprint": expected_host_key_fingerprint},
+                    suggested_fixes=fixes,
+                )
+            return _tool_error(code="SSH_ERROR", message=f"{type(exc).__name__}: {exc}", details={"profile": profile})
+        except Exception as exc:
+            return _tool_error(code="RUN_FAILED", message=f"{type(exc).__name__}: {exc}", details={"profile": profile})
+
         return {
             "content": _result_text_block(json.dumps(structured, ensure_ascii=False, indent=2)),
             "structuredContent": structured,
@@ -156,10 +586,80 @@ def _call_tool(cfg_path: str, *, tool_name: str, args: dict[str, Any] | None) ->
         local_path = args.get("local_path")
         remote_path = args.get("remote_path")
         overwrite = args.get("overwrite")
+        known_hosts_policy = args.get("known_hosts_policy")
+        known_hosts_path = args.get("known_hosts_path") if "known_hosts_path" in args else None
+        has_known_hosts_path_override = "known_hosts_path" in args
+        expected_host_key_fingerprint = args.get("expected_host_key_fingerprint")
         if not all(isinstance(x, str) for x in (profile, local_path, remote_path)) or not isinstance(overwrite, bool):
             raise ValueError("ssh.upload requires args: profile(str), local_path(str), remote_path(str), overwrite(bool)")
+        if known_hosts_policy is not None and not isinstance(known_hosts_policy, str):
+            raise ValueError("known_hosts_policy must be a string")
+        if has_known_hosts_path_override and known_hosts_path is not None and not isinstance(known_hosts_path, str):
+            raise ValueError("known_hosts_path must be a string or null")
+        if expected_host_key_fingerprint is not None and not isinstance(expected_host_key_fingerprint, str):
+            raise ValueError("expected_host_key_fingerprint must be a string")
         client = build_client(cfg, profile)
-        structured = client.upload(local_path, remote_path, overwrite=overwrite)
+        upload_kwargs: dict[str, Any] = {"overwrite": overwrite, "report_host_key": True}
+        if known_hosts_policy is not None:
+            upload_kwargs["known_hosts_policy"] = known_hosts_policy
+        if has_known_hosts_path_override:
+            upload_kwargs["known_hosts_path"] = known_hosts_path
+        if expected_host_key_fingerprint is not None:
+            upload_kwargs["expected_host_key_fingerprint"] = expected_host_key_fingerprint
+        try:
+            structured = client.upload(local_path, remote_path, **upload_kwargs)
+        except paramiko.ssh_exception.BadHostKeyException as exc:
+            host, port, _proxy = _server_from_profile(cfg, profile)
+            expected = HostKeyInfo.from_key(host=host, port=port, key=exc.expected_key).to_dict()
+            got = HostKeyInfo.from_key(host=host, port=port, key=exc.key).to_dict()
+            return _tool_error(
+                code="KNOWN_HOST_CHANGED",
+                message=str(exc),
+                details={"profile": profile, "expected": expected, "got": got},
+            )
+        except paramiko.ssh_exception.SSHException as exc:
+            msg = str(exc)
+            if "not found in known_hosts" in msg:
+                host, port, _proxy = _server_from_profile(cfg, profile)
+                kh_path = (
+                    known_hosts_path
+                    if has_known_hosts_path_override
+                    else cfg.defaults.known_hosts_path
+                )
+                ensure_args: dict[str, Any] = {
+                    "profile": profile,
+                    "known_hosts_path": kh_path or "~/.ssh/known_hosts",
+                }
+                if expected_host_key_fingerprint is not None:
+                    ensure_args["expected_host_key_fingerprint"] = expected_host_key_fingerprint
+                return _tool_error(
+                    code="KNOWN_HOST_MISSING",
+                    message=msg,
+                    details={
+                        "profile": profile,
+                        "host": host,
+                        "port": port,
+                        "host_id": format_host_id(host, port),
+                        "known_hosts_path": kh_path,
+                    },
+                    suggested_fixes=[
+                        {
+                            "tool": "ssh.ensure_known_host",
+                            "arguments": ensure_args,
+                            "note": "Scan+write known_hosts, then retry upload.",
+                        }
+                    ],
+                )
+            if "host key fingerprint mismatch" in msg:
+                return _tool_error(
+                    code="HOST_KEY_FINGERPRINT_MISMATCH",
+                    message=msg,
+                    details={"profile": profile, "expected_host_key_fingerprint": expected_host_key_fingerprint},
+                    suggested_fixes=[{"tool": "ssh.scan_host_key", "arguments": {"profile": profile}}],
+                )
+            return _tool_error(code="SSH_ERROR", message=f"{type(exc).__name__}: {exc}", details={"profile": profile})
+        except Exception as exc:
+            return _tool_error(code="UPLOAD_FAILED", message=f"{type(exc).__name__}: {exc}", details={"profile": profile})
         return {
             "content": _result_text_block(json.dumps(structured, ensure_ascii=False, indent=2)),
             "structuredContent": structured,
@@ -171,12 +671,82 @@ def _call_tool(cfg_path: str, *, tool_name: str, args: dict[str, Any] | None) ->
         remote_path = args.get("remote_path")
         local_path = args.get("local_path")
         overwrite = args.get("overwrite")
+        known_hosts_policy = args.get("known_hosts_policy")
+        known_hosts_path = args.get("known_hosts_path") if "known_hosts_path" in args else None
+        has_known_hosts_path_override = "known_hosts_path" in args
+        expected_host_key_fingerprint = args.get("expected_host_key_fingerprint")
         if not all(isinstance(x, str) for x in (profile, remote_path, local_path)) or not isinstance(overwrite, bool):
             raise ValueError(
                 "ssh.download requires args: profile(str), remote_path(str), local_path(str), overwrite(bool)"
             )
+        if known_hosts_policy is not None and not isinstance(known_hosts_policy, str):
+            raise ValueError("known_hosts_policy must be a string")
+        if has_known_hosts_path_override and known_hosts_path is not None and not isinstance(known_hosts_path, str):
+            raise ValueError("known_hosts_path must be a string or null")
+        if expected_host_key_fingerprint is not None and not isinstance(expected_host_key_fingerprint, str):
+            raise ValueError("expected_host_key_fingerprint must be a string")
         client = build_client(cfg, profile)
-        structured = client.download(remote_path, local_path, overwrite=overwrite)
+        dl_kwargs: dict[str, Any] = {"overwrite": overwrite, "report_host_key": True}
+        if known_hosts_policy is not None:
+            dl_kwargs["known_hosts_policy"] = known_hosts_policy
+        if has_known_hosts_path_override:
+            dl_kwargs["known_hosts_path"] = known_hosts_path
+        if expected_host_key_fingerprint is not None:
+            dl_kwargs["expected_host_key_fingerprint"] = expected_host_key_fingerprint
+        try:
+            structured = client.download(remote_path, local_path, **dl_kwargs)
+        except paramiko.ssh_exception.BadHostKeyException as exc:
+            host, port, _proxy = _server_from_profile(cfg, profile)
+            expected = HostKeyInfo.from_key(host=host, port=port, key=exc.expected_key).to_dict()
+            got = HostKeyInfo.from_key(host=host, port=port, key=exc.key).to_dict()
+            return _tool_error(
+                code="KNOWN_HOST_CHANGED",
+                message=str(exc),
+                details={"profile": profile, "expected": expected, "got": got},
+            )
+        except paramiko.ssh_exception.SSHException as exc:
+            msg = str(exc)
+            if "not found in known_hosts" in msg:
+                host, port, _proxy = _server_from_profile(cfg, profile)
+                kh_path = (
+                    known_hosts_path
+                    if has_known_hosts_path_override
+                    else cfg.defaults.known_hosts_path
+                )
+                ensure_args: dict[str, Any] = {
+                    "profile": profile,
+                    "known_hosts_path": kh_path or "~/.ssh/known_hosts",
+                }
+                if expected_host_key_fingerprint is not None:
+                    ensure_args["expected_host_key_fingerprint"] = expected_host_key_fingerprint
+                return _tool_error(
+                    code="KNOWN_HOST_MISSING",
+                    message=msg,
+                    details={
+                        "profile": profile,
+                        "host": host,
+                        "port": port,
+                        "host_id": format_host_id(host, port),
+                        "known_hosts_path": kh_path,
+                    },
+                    suggested_fixes=[
+                        {
+                            "tool": "ssh.ensure_known_host",
+                            "arguments": ensure_args,
+                            "note": "Scan+write known_hosts, then retry download.",
+                        }
+                    ],
+                )
+            if "host key fingerprint mismatch" in msg:
+                return _tool_error(
+                    code="HOST_KEY_FINGERPRINT_MISMATCH",
+                    message=msg,
+                    details={"profile": profile, "expected_host_key_fingerprint": expected_host_key_fingerprint},
+                    suggested_fixes=[{"tool": "ssh.scan_host_key", "arguments": {"profile": profile}}],
+                )
+            return _tool_error(code="SSH_ERROR", message=f"{type(exc).__name__}: {exc}", details={"profile": profile})
+        except Exception as exc:
+            return _tool_error(code="DOWNLOAD_FAILED", message=f"{type(exc).__name__}: {exc}", details={"profile": profile})
         return {
             "content": _result_text_block(json.dumps(structured, ensure_ascii=False, indent=2)),
             "structuredContent": structured,
@@ -248,7 +818,7 @@ def main(argv: list[str] | None = None) -> int:
                     "protocolVersion": negotiated,
                     "capabilities": {"tools": {"listChanged": False}},
                     "serverInfo": {"name": "sshoc", "version": __version__},
-                    "instructions": "Use tools/list then tools/call with ssh.run / ssh.upload / ssh.download.",
+                    "instructions": "Use tools/list then tools/call. Tools include ssh.run / ssh.upload / ssh.download and host key helpers (ssh.scan_host_key / ssh.ensure_known_host).",
                 }
 
             write_message(safe_call(_handle_init, request_id=request_id, debug=debug))

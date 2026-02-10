@@ -2,12 +2,13 @@
 
 English | [简体中文](README.md)
 
-A lightweight, config-driven SSH toolkit (CLI + optional MCP stdio adapter). Configure multiple servers in `json`, then use:
+A lightweight, config-driven SSH toolkit (CLI + optional MCP stdio adapter).
 
-- **CLI prefix command**: `sshoc <profile>: <command...>` (quickly run remote commands)
-- **MCP (stdio) server**: Exposes `tools/list` / `tools/call` so MCP clients can call `ssh.run` / `ssh.upload` / `ssh.download`
+- **CLI**: `sshoc` (`list/run/upload/download/hostkey/...`, plus prefix mode `sshoc <profile>: <command...>`)
+- **MCP (stdio)**: `sshoc-mcp` (line-delimited JSON-RPC, exposes `ssh.*` tools to MCP clients)
+- **Dependency**: `paramiko` (SSH/SFTP)
 
-> Dependency: `paramiko` (SSH/SFTP).
+> Goal: strict, predictable, easy to embed (especially for automation / AI workflows).
 
 ---
 
@@ -19,7 +20,7 @@ A lightweight, config-driven SSH toolkit (CLI + optional MCP stdio adapter). Con
 python -m pip install -U sshoc
 ```
 
-2) Initialize config (write to the per-user config directory, recommended):
+2) Initialize config (recommended: per-user config directory):
 
 ```bash
 # Password auth (recommended: store password in an env var)
@@ -29,7 +30,7 @@ sshoc init demo --ssh "ssh -p 22 user@host" --password-env SSHOC_DEMO_PASSWORD
 sshoc init demo --ssh "ssh -p 22 user@host" --key-path ~/.ssh/id_ed25519
 ```
 
-3) Set the password environment variable (only needed for `password_env`):
+3) Set the password env var (only needed for `password_env`):
 
 ```powershell
 $env:SSHOC_DEMO_PASSWORD="your_password"
@@ -39,26 +40,29 @@ $env:SSHOC_DEMO_PASSWORD="your_password"
 export SSHOC_DEMO_PASSWORD="your_password"
 ```
 
-4) Use:
+4) First connection (known_hosts):
+
+Default `known_hosts_policy=strict`. If the host key is not present in your local `known_hosts`, the first connection will fail. Recommended: write the host key first (optionally verify a trusted fingerprint):
 
 ```bash
-sshoc list
+sshoc hostkey ensure demo
+# Strongly recommended (if you can get a trusted fingerprint from your provider/admin):
+# sshoc hostkey ensure demo --expected-fingerprint "SHA256:..."
+```
+
+5) Run a command:
+
+```bash
 sshoc demo: uname -a
+# Or
+sshoc run demo --cmd "uname -a"
 ```
 
 ---
 
-## Installation
+## Installation (development)
 
-### Option A: Install from PyPI (recommended)
-
-```bash
-python -m pip install -U sshoc
-```
-
-### Option B: Install from source (development)
-
-Recommended: create a virtual environment in this directory (or use your preferred workflow):
+Install from source (recommended: create a venv in this directory):
 
 ```bash
 cd "SSH_Operation_Component (MCP)"
@@ -72,47 +76,13 @@ python -m pip install -e .
 
 ## Configuration
 
-### 1) Generate config (`sshoc init`)
-
-```bash
-# Write to the per-user config directory (recommended)
-sshoc init
-
-# Or write to ./sshoc.config.json in the current directory
-sshoc init --local
-
-# Or write to an arbitrary path
-sshoc init --output /path/to/sshoc.config.json
-```
-
-Notes:
-
-- `sshoc init` (without `<profile>`) writes the **full template** (including the demo profile).
-- `sshoc init <profile> --ssh ... --password-env/--password/--key-path ...` writes a **single-profile config** (better for a quick start with pip).
-
-### 2) Where is the config file (and which one is currently in use)?
-
-Use this command to see which config file is being used:
+### Where is the config file (and which one is in use)?
 
 ```bash
 sshoc config path
 ```
 
-It prints:
-
-- `path`: config file path
-- `source`: where it comes from (`cli|env|cwd|user|package`)
-- `exists`: whether the path exists
-
-Default per-user config locations:
-
-- Windows: `%APPDATA%\\sshoc\\sshoc.config.json`
-- macOS: `~/Library/Application Support/sshoc/sshoc.config.json`
-- Linux: `~/.config/sshoc/sshoc.config.json` (or `$XDG_CONFIG_HOME/sshoc/sshoc.config.json`)
-
-### 3) Practical tip: pin the config path with `SSHOC_CONFIG`
-
-If you want the same config to be used no matter which directory you run from, set `SSHOC_CONFIG`:
+### Practical tip: pin the config path with `SSHOC_CONFIG`
 
 ```powershell
 $env:SSHOC_CONFIG="C:\\path\\to\\sshoc.config.json"
@@ -122,88 +92,59 @@ $env:SSHOC_CONFIG="C:\\path\\to\\sshoc.config.json"
 export SSHOC_CONFIG="/path/to/sshoc.config.json"
 ```
 
-### 4) (Optional) Repo development: copy the template file
+### Key fields (cheatsheet)
 
-If you're developing in this repo, you can also copy the template to `sshoc.config.json` (it includes `$schema` pointing to `sshoc.config.schema.json` for IDE hints; the parser also allows this field):
-
-```bash
-# macOS / Linux
-cp sshoc.config.template.json sshoc.config.json
-```
-
-```powershell
-# Windows PowerShell / CMD
-copy sshoc.config.template.json sshoc.config.json
-# Or:
-Copy-Item sshoc.config.template.json sshoc.config.json
-```
-
-Then set the password (recommended: use env vars and avoid committing plaintext passwords):
-
-```powershell
-$env:SSHOC_DEMO_PASSWORD="your_password"
-```
-
-### Key config fields
-
-- `servers.<profile>`: your profile name (recommended: `a-zA-Z0-9_-`)
-- `servers.<profile>.ssh_command`: supports common forms like `ssh -p <port> user@host` (for advanced ssh options, prefer explicit fields / feature extensions)
+- `servers.<profile>`: profile name (recommended: `A-Za-z0-9_-`)
+- `servers.<profile>.ssh_command`: common form `ssh -p <port> user@host`
 - `auth.type`:
-  - `password`: supports `password` or `password_env`
-  - `key`: supports `private_key_path` (optional `private_key_passphrase_env`)
+  - `password`: `password` or `password_env`
+  - `key`: `private_key_path` (optional `private_key_passphrase_env`)
 - `known_hosts_policy`:
   - `strict`: default; unknown host keys fail fast (safer)
-  - `accept_new`: on first connect, automatically writes to `known_hosts_path`
-- `default_shell`: optional; commonly `bash -lc` (closer to an interactive environment). Set to `null` if the remote has no bash
+  - `accept_new`: auto-write to `known_hosts_path` on first connect (TOFU)
+- `known_hosts_path`: OpenSSH `known_hosts` path (template default: `~/.ssh/known_hosts`)
+- `default_shell`: default `bash -lc` (set to `null` if the remote has no bash)
 
 ---
 
-## CLI usage (prefix command)
+## CLI
 
-List all configured profiles:
+### Common commands
 
 ```bash
 sshoc list
-```
-
-### Profile management (edit the config file)
-
-> These commands modify the currently effective config file in place. Use `sshoc config path` to confirm the path first, or specify it explicitly with `--config <path>`.
-
-```bash
-# Remove a profile
-sshoc profile remove demo
-
-# Clear all profiles (set `servers` to an empty object)
-sshoc profile clear
-```
-
-Run a remote command (recommended prefix form):
-
-```bash
-sshoc demo: uname -a
 sshoc demo: "ls -la /root"
-```
-
-Explicit subcommands (easier to parameterize):
-
-```bash
 sshoc run demo --cmd "python -V"
 sshoc upload demo --local ./local.txt --remote /tmp/local.txt --overwrite
 sshoc download demo --remote /tmp/local.txt --local ./downloaded.txt --overwrite
 ```
 
-Default config resolution order:
+### Host key / known_hosts
 
-1. `--config <path>`
-2. Environment variable `SSHOC_CONFIG`
-3. Current directory `./sshoc.config.json`
-4. Per-user config directory (Windows: `%APPDATA%\\sshoc\\sshoc.config.json`; Linux: `~/.config/sshoc/sshoc.config.json`)
-5. `sshoc.config.json` inside the package/source directory (dev fallback)
+These commands print JSON (friendly for scripts/CI/automation).
+
+```bash
+# Scan the remote host key (no auth)
+sshoc hostkey scan demo
+
+# Check whether the host is present in known_hosts
+sshoc hostkey is-known demo
+
+# Scan + write into known_hosts (optional fingerprint verification)
+sshoc hostkey ensure demo
+sshoc hostkey ensure demo --expected-fingerprint "SHA256:..."
+
+# Manually add a key (if you already have key_type + base64)
+sshoc hostkey add demo --key-type ssh-ed25519 --public-key-base64 "<BASE64>"
+
+# Precise removal: remove one key type, or remove all key types for the host
+sshoc hostkey remove demo --key-type ssh-ed25519
+sshoc hostkey remove demo --all-types
+```
 
 ---
 
-## MCP (stdio) server usage
+## MCP (stdio) server
 
 Start:
 
@@ -211,18 +152,20 @@ Start:
 sshoc-mcp
 ```
 
-It communicates over `stdin/stdout` using **line-delimited JSON** (JSON-RPC), matching MCP's common stdio transport pattern.
-
-Tools provided:
+Tools:
 
 - `ssh.list_profiles`
+- `ssh.scan_host_key`
+- `ssh.is_known_host`
+- `ssh.add_known_host`
+- `ssh.ensure_known_host`
 - `ssh.run`
 - `ssh.upload`
 - `ssh.download`
 
 ### Generic stdio config blueprint (for MCP clients)
 
-Different MCP clients may use different config file formats, but the essentials are usually: `command` / `args` / `env` / `cwd`. Below is a generic blueprint (field names are for reference—adapt to your client):
+Different MCP clients may use different config formats, but the essentials are usually: `command` / `args` / `env` / `cwd`. Below is a generic blueprint (field names are for reference—adapt to your client):
 
 ```jsonc
 {
@@ -243,21 +186,16 @@ Different MCP clients may use different config file formats, but the essentials 
 // - Windows: C:\\path\\to\\sshoc.config.json
 ```
 
-Two common variants (choose what fits your client):
-
-- If your client can't easily pass `args`: pin the config path via `SSHOC_CONFIG` (and still inject the password env var required by `password_env` via `env`).
-- If `sshoc-mcp` is not on `PATH`: start it via your venv with `python -m sshoc.mcp_server --config <ABS_CONFIG_PATH>`.
-
 ---
 
 ## Security notes (strongly recommended)
 
-- Never commit plaintext server passwords. Prefer `password_env`.
-- This tool effectively gives AI a remote execution entry point—use it only in environments you trust.
+- Never commit plaintext passwords; prefer `password_env`
+- `accept_new` is TOFU (trust on first use); safer: verify with `--expected-fingerprint`
+- This tool effectively gives automation/AI a remote execution entry point—use it only in environments you trust
 
 ---
 
 ## License
 
-Apache-2.0 (see `LICENSE`).
-
+Apache-2.0 (see `LICENSE`)

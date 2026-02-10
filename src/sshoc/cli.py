@@ -14,6 +14,14 @@ from .config import (
     resolve_config_path_info,
     resolve_default_config_path,
 )
+from .host_keys import (
+    add_known_host,
+    ensure_known_host,
+    format_host_id,
+    known_hosts_entries,
+    remove_known_host,
+    scan_host_key,
+)
 from .ssh_client import build_client
 
 
@@ -69,6 +77,138 @@ def _cmd_download(args: argparse.Namespace) -> int:
     cfg = load_config(cfg_path)
     client = build_client(cfg, args.profile)
     result = client.download(args.remote, args.local, overwrite=args.overwrite)
+    sys.stdout.write(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+    return 0
+
+
+def _resolve_hostkey_target(cfg, args: argparse.Namespace) -> tuple[str, int, str | None, str | None]:
+    """
+    Resolve (host, port, proxy_command, profile) from either:
+      - positional <profile>
+      - or: --host/--port/--proxy-command
+    """
+    profile = getattr(args, "profile", None)
+    host = getattr(args, "host", None)
+    port = getattr(args, "port", 22)
+    proxy_command = getattr(args, "proxy_command", None)
+
+    if profile is not None and host is not None:
+        raise ValueError("provide either <profile> or --host/--port, not both")
+
+    if profile is not None:
+        if not isinstance(profile, str) or profile == "":
+            raise ValueError("<profile> must be a non-empty string")
+        srv = cfg.get_server(profile)
+        return srv.host, srv.port, srv.proxy_command, profile
+
+    if host is None:
+        raise ValueError("hostkey commands require <profile> or --host")
+    if not isinstance(host, str) or host == "":
+        raise ValueError("--host must be a non-empty string")
+    if not isinstance(port, int):
+        raise ValueError("--port must be an integer")
+    return host, port, proxy_command, None
+
+
+def _resolve_known_hosts_path(cfg, args: argparse.Namespace) -> str:
+    kh_path = getattr(args, "known_hosts_path", None)
+    if kh_path is None:
+        kh_path = cfg.defaults.known_hosts_path
+    if kh_path is None:
+        raise ValueError("known_hosts_path is null; set defaults.known_hosts_path or pass --known-hosts-path")
+    if not isinstance(kh_path, str) or kh_path == "":
+        raise ValueError("--known-hosts-path must be a non-empty string")
+    return kh_path
+
+
+def _cmd_hostkey_scan(args: argparse.Namespace) -> int:
+    cfg_path = resolve_default_config_path(cli_path=args.config)
+    cfg = load_config(cfg_path)
+    host, port, proxy_command, profile = _resolve_hostkey_target(cfg, args)
+
+    info, _key = scan_host_key(host, port, proxy_command=proxy_command, timeout_sec=args.timeout_sec)
+    out: dict[str, Any] = {"host_key": info.to_dict()}
+    if profile is not None:
+        out["profile"] = profile
+    sys.stdout.write(json.dumps(out, ensure_ascii=False, indent=2) + "\n")
+    return 0
+
+
+def _cmd_hostkey_is_known(args: argparse.Namespace) -> int:
+    cfg_path = resolve_default_config_path(cli_path=args.config)
+    cfg = load_config(cfg_path)
+    host, port, _proxy_command, profile = _resolve_hostkey_target(cfg, args)
+    kh_path = _resolve_known_hosts_path(cfg, args)
+
+    entries = known_hosts_entries(known_hosts_path=kh_path, host=host, port=port)
+    out: dict[str, Any] = {
+        "known": bool(entries),
+        "known_hosts_path": kh_path,
+        "host_id": format_host_id(host, port),
+        "entries": [e.to_dict() for e in entries],
+    }
+    if profile is not None:
+        out["profile"] = profile
+    sys.stdout.write(json.dumps(out, ensure_ascii=False, indent=2) + "\n")
+    return 0
+
+
+def _cmd_hostkey_add(args: argparse.Namespace) -> int:
+    cfg_path = resolve_default_config_path(cli_path=args.config)
+    cfg = load_config(cfg_path)
+    host, port, _proxy_command, profile = _resolve_hostkey_target(cfg, args)
+    kh_path = _resolve_known_hosts_path(cfg, args)
+
+    result = add_known_host(
+        known_hosts_path=kh_path,
+        host=host,
+        port=port,
+        key_type=args.key_type,
+        public_key_base64=args.public_key_base64,
+        overwrite=args.overwrite,
+    )
+    if profile is not None:
+        result["profile"] = profile
+    sys.stdout.write(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+    return 0
+
+
+def _cmd_hostkey_ensure(args: argparse.Namespace) -> int:
+    cfg_path = resolve_default_config_path(cli_path=args.config)
+    cfg = load_config(cfg_path)
+    host, port, proxy_command, profile = _resolve_hostkey_target(cfg, args)
+    kh_path = _resolve_known_hosts_path(cfg, args)
+
+    result = ensure_known_host(
+        known_hosts_path=kh_path,
+        host=host,
+        port=port,
+        proxy_command=proxy_command,
+        timeout_sec=args.timeout_sec,
+        expected_host_key_fingerprint=args.expected_fingerprint,
+        overwrite=args.overwrite,
+    )
+    if profile is not None:
+        result["profile"] = profile
+    sys.stdout.write(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+    return 0
+
+
+def _cmd_hostkey_remove(args: argparse.Namespace) -> int:
+    cfg_path = resolve_default_config_path(cli_path=args.config)
+    cfg = load_config(cfg_path)
+    host, port, _proxy_command, profile = _resolve_hostkey_target(cfg, args)
+    kh_path = _resolve_known_hosts_path(cfg, args)
+
+    result = remove_known_host(
+        known_hosts_path=kh_path,
+        host=host,
+        port=port,
+        key_type=args.key_type,
+        remove_all_types=args.all_types,
+    )
+    if profile is not None:
+        result["profile"] = profile
     sys.stdout.write(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
     return 0
 
@@ -284,6 +424,60 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--local", required=True)
     sp.add_argument("--overwrite", action="store_true")
     sp.set_defaults(_handler=_cmd_download)
+
+    sp = sub.add_parser("hostkey", help="Host key / known_hosts helpers")
+    sub2 = sp.add_subparsers(dest="hostkey_subcmd", required=True)
+
+    sp2 = sub2.add_parser("scan", help="Scan remote SSH host key (no auth)")
+    _add_config_arg(sp2)
+    sp2.add_argument("profile", nargs="?", help="Profile name (omit when using --host)")
+    sp2.add_argument("--host", help="Host (when not using profile)")
+    sp2.add_argument("--port", type=int, default=22, help="Port (when not using profile)")
+    sp2.add_argument("--proxy-command", dest="proxy_command", help="ProxyCommand (when not using profile)")
+    sp2.add_argument("--timeout-sec", dest="timeout_sec", type=float, default=10.0)
+    sp2.set_defaults(_handler=_cmd_hostkey_scan)
+
+    sp2 = sub2.add_parser("is-known", help="Check known_hosts for a host")
+    _add_config_arg(sp2)
+    sp2.add_argument("profile", nargs="?", help="Profile name (omit when using --host)")
+    sp2.add_argument("--host", help="Host (when not using profile)")
+    sp2.add_argument("--port", type=int, default=22, help="Port (when not using profile)")
+    sp2.add_argument("--known-hosts-path", dest="known_hosts_path")
+    sp2.set_defaults(_handler=_cmd_hostkey_is_known)
+
+    sp2 = sub2.add_parser("add", help="Add a host key entry to known_hosts")
+    _add_config_arg(sp2)
+    sp2.add_argument("profile", nargs="?", help="Profile name (omit when using --host)")
+    sp2.add_argument("--host", help="Host (when not using profile)")
+    sp2.add_argument("--port", type=int, default=22, help="Port (when not using profile)")
+    sp2.add_argument("--known-hosts-path", dest="known_hosts_path")
+    sp2.add_argument("--key-type", required=True)
+    sp2.add_argument("--public-key-base64", required=True)
+    sp2.add_argument("--overwrite", action="store_true")
+    sp2.set_defaults(_handler=_cmd_hostkey_add)
+
+    sp2 = sub2.add_parser("ensure", help="Scan and write the host key into known_hosts")
+    _add_config_arg(sp2)
+    sp2.add_argument("profile", nargs="?", help="Profile name (omit when using --host)")
+    sp2.add_argument("--host", help="Host (when not using profile)")
+    sp2.add_argument("--port", type=int, default=22, help="Port (when not using profile)")
+    sp2.add_argument("--proxy-command", dest="proxy_command", help="ProxyCommand (when not using profile)")
+    sp2.add_argument("--timeout-sec", dest="timeout_sec", type=float, default=10.0)
+    sp2.add_argument("--known-hosts-path", dest="known_hosts_path")
+    sp2.add_argument("--expected-fingerprint", dest="expected_fingerprint")
+    sp2.add_argument("--overwrite", action="store_true")
+    sp2.set_defaults(_handler=_cmd_hostkey_ensure)
+
+    sp2 = sub2.add_parser("remove", help="Remove a host key entry from known_hosts")
+    _add_config_arg(sp2)
+    sp2.add_argument("profile", nargs="?", help="Profile name (omit when using --host)")
+    sp2.add_argument("--host", help="Host (when not using profile)")
+    sp2.add_argument("--port", type=int, default=22, help="Port (when not using profile)")
+    sp2.add_argument("--known-hosts-path", dest="known_hosts_path")
+    group = sp2.add_mutually_exclusive_group(required=True)
+    group.add_argument("--key-type")
+    group.add_argument("--all-types", action="store_true")
+    sp2.set_defaults(_handler=_cmd_hostkey_remove)
 
     sp = sub.add_parser("init", help="Create a sshoc.config.json (template or single-profile)")
     sp.add_argument("profile", nargs="?", help="Profile name to create (omit to write full template)")
