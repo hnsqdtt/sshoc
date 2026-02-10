@@ -4,9 +4,9 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sshoc"
-version = "0.1.0"
+version = "0.1.1"
 description = "Lightweight SSH toolkit with optional MCP(stdio) JSON-RPC adapter"
-readme = "README.md"
+readme = "README.en.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 classifiers = [

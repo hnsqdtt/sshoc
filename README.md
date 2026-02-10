@@ -1,9 +1,13 @@
 # SSHOC
 
-一个轻量、配置驱动的 SSH 工具集合（CLI + 可选 MCP stdio 适配）：用 `json` 配置多台服务器，然后通过：
+简体中文 | [English](README.en.md)
+
+一个轻量、配置驱动的 SSH 工具集合（CLI + 可选 MCP stdio 适配）。用 `json` 配置多台服务器，然后通过：
 
 - **CLI 前缀命令**：`sshoc <profile>: <command...>`（快速执行远端命令）
 - **MCP(stdio) 服务**：对外暴露 `tools/list` / `tools/call`，让支持 MCP 的客户端直接调用 `ssh.run` / `ssh.upload` / `ssh.download`
+
+> 依赖：`paramiko`（SSH/SFTP）。
 
 ---
 
@@ -63,8 +67,6 @@ python -m venv .venv
 python -m pip install -U pip
 python -m pip install -e .
 ```
-
-> 依赖：`paramiko`（SSH/SFTP）。
 
 ---
 
@@ -218,6 +220,34 @@ sshoc-mcp
 - `ssh.upload`
 - `ssh.download`
 
+### 通用 stdio 配置蓝图（供 MCP 客户端参考）
+
+不同 MCP 客户端的配置文件格式可能不同，但核心都离不开：`command` / `args` / `env` / `cwd`。下面给一个“通用蓝图”示例（字段名仅供参考，请按你的客户端实际格式填入）：
+
+```jsonc
+{
+  "mcpServers": {
+    "sshoc": {
+      "command": "sshoc-mcp",
+      "args": ["--config", "<ABS_CONFIG_PATH>"],
+      "env": {
+        "SSHOC_DEMO_PASSWORD": "your_password",
+        "SSHOC_DEBUG": "0"
+      },
+      "cwd": "<OPTIONAL_WORKDIR>"
+    }
+  }
+}
+// <ABS_CONFIG_PATH> 示例：
+// - macOS/Linux: /path/to/sshoc.config.json
+// - Windows: C:\\path\\to\\sshoc.config.json
+```
+
+两个常见变体（按需选择其一）：
+
+- 如果你的客户端不方便传 `args`：用环境变量 `SSHOC_CONFIG` 固定配置路径（并继续在 `env` 注入 `password_env` 对应的密码变量）。
+- 如果 `sshoc-mcp` 不在 PATH：改用 venv 的 `python -m sshoc.mcp_server --config <ABS_CONFIG_PATH>` 启动。
+
 ---
 
 ## 安全提示（强烈建议）
@@ -230,3 +260,4 @@ sshoc-mcp
 ## License
 
 Apache-2.0（见 `LICENSE`）。
+
