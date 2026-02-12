@@ -20,6 +20,12 @@
 python -m pip install -U sshoc
 ```
 
+> Windows 提示：如果安装后 `sshoc` 仍提示“不是内部或外部命令”，通常是脚本目录（包含 `sshoc.exe`）不在 `PATH`。可用下面命令查看脚本目录并加入 `PATH`，然后重新打开终端：
+>
+> ```bash
+> python -c "import sysconfig; print(sysconfig.get_path('scripts'))"
+> ```
+
 2) 初始化配置（推荐写入用户配置目录）：
 
 ```bash

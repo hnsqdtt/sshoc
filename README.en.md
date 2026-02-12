@@ -20,6 +20,12 @@ A lightweight, config-driven SSH toolkit (CLI + optional MCP stdio adapter).
 python -m pip install -U sshoc
 ```
 
+> Windows note: if `sshoc` is still “not recognized” after install, your Python scripts directory (where `sshoc.exe` is generated) is likely not on `PATH`. Print the scripts directory and add it to `PATH`, then reopen your terminal:
+>
+> ```bash
+> python -c "import sysconfig; print(sysconfig.get_path('scripts'))"
+> ```
+
 2) Initialize config (recommended: per-user config directory):
 
 ```bash

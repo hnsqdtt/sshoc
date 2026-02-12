@@ -29,6 +29,41 @@ def _add_config_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", help="Path to sshoc.config.json (or set SSHOC_CONFIG)")
 
 
+def _configure_utf8_stdio() -> None:
+    """
+    Best-effort UTF-8 output on Windows consoles (avoid garbled non-ASCII paths).
+    """
+    if os.name != "nt":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+def _subcmd_requires_config(args: argparse.Namespace) -> bool:
+    subcmd = getattr(args, "subcmd", None)
+    if subcmd in (None, "init"):
+        return False
+    if subcmd == "config" and getattr(args, "config_subcmd", None) == "path":
+        return False
+    return True
+
+
+def _eprint(msg: str) -> None:
+    sys.stderr.write(msg + "\n")
+
+
+def _print_missing_config_hint() -> None:
+    _eprint("Next:")
+    _eprint("  sshoc init --local")
+    _eprint('  sshoc init demo --ssh "ssh -p 22 user@host" --password-env SSHOC_DEMO_PASSWORD')
+
+
 def _cmd_list(args: argparse.Namespace) -> int:
     cfg_path = resolve_default_config_path(cli_path=args.config)
     cfg = load_config(cfg_path)
@@ -534,6 +569,7 @@ def _rewrite_prefix_argv(argv: list[str]) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _configure_utf8_stdio()
     argv = sys.argv if argv is None else [sys.argv[0], *argv]
     argv = _rewrite_prefix_argv(list(argv))
     parser = _build_parser()
@@ -544,7 +580,14 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     handler = getattr(args, "_handler")
-    return int(handler(args))
+    try:
+        return int(handler(args))
+    except FileNotFoundError as exc:
+        _eprint(f"sshoc: error: {exc}")
+        info = resolve_config_path_info(cli_path=getattr(args, "config", None))
+        if _subcmd_requires_config(args) and not info.exists:
+            _print_missing_config_hint()
+        return 2
 
 
 if __name__ == "__main__":
