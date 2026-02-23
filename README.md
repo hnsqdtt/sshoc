@@ -160,6 +160,7 @@ sshoc-mcp
 
 提供的工具：
 
+- `ssh.init_config` — 创建 `sshoc.config.json`（无配置时优先调用；AI 可自行完成配置）
 - `ssh.list_profiles`
 - `ssh.scan_host_key`
 - `ssh.is_known_host`
@@ -168,6 +169,8 @@ sshoc-mcp
 - `ssh.run`
 - `ssh.upload`
 - `ssh.download`
+
+> 零配置启动：`sshoc-mcp` 即使没有配置文件也能正常启动。需要配置的工具会返回 `CONFIG_NOT_FOUND` 错误并建议调用 `ssh.init_config`。这样 MCP 客户端（如 AI 助手）可以先发现工具，再按需创建配置。
 
 ### 通用 stdio 配置蓝图（供 MCP 客户端参考）
 
@@ -178,18 +181,16 @@ sshoc-mcp
   "mcpServers": {
     "sshoc": {
       "command": "sshoc-mcp",
-      "args": ["--config", "<ABS_CONFIG_PATH>"],
+      // args/env 可选；AI 可通过 ssh.init_config 自行创建配置。
+      // 如需固定配置文件路径：
+      // "args": ["--config", "<ABS_CONFIG_PATH>"],
       "env": {
         "SSHOC_DEMO_PASSWORD": "your_password",
         "SSHOC_DEBUG": "0"
-      },
-      "cwd": "<OPTIONAL_WORKDIR>"
+      }
     }
   }
 }
-// <ABS_CONFIG_PATH> 示例：
-// - macOS/Linux: /path/to/sshoc.config.json
-// - Windows: C:\\path\\to\\sshoc.config.json
 ```
 
 ---

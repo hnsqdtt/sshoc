@@ -3,12 +3,18 @@ from __future__ import annotations
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Any
 
 import paramiko
 
 from . import __version__
-from .config import load_config, resolve_default_config_path
+from .config import (
+    config_from_dict,
+    default_user_config_path,
+    load_config,
+    resolve_config_path_info,
+)
 from .host_keys import (
     HostKeyInfo,
     add_known_host,
@@ -26,6 +32,17 @@ from .jsonrpc import (
     write_message,
 )
 from .ssh_client import build_client
+
+
+class _ServerState:
+    """Mutable runtime state shared across the MCP message loop."""
+
+    def __init__(self, cfg_path: str | None) -> None:
+        self.cfg_path = cfg_path
+
+
+# Tools that work without a config file.
+_NO_CONFIG_TOOLS = frozenset({"ssh.init_config", "ssh.scan_host_key"})
 
 
 LATEST_PROTOCOL_VERSION = "2025-11-25"
@@ -59,6 +76,87 @@ def _server_from_profile(cfg, profile: str) -> tuple[str, int, str | None]:
 
 def _tool_list() -> list[dict[str, Any]]:
     return [
+        {
+            "name": "ssh.init_config",
+            "description": (
+                "Create sshoc.config.json so the MCP server can connect to SSH hosts. "
+                "Call this first if other tools return CONFIG_NOT_FOUND. "
+                "Only 'servers' is required; 'defaults' is optional (sensible values are used when omitted)."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["servers"],
+                "properties": {
+                    "servers": {
+                        "type": "object",
+                        "description": (
+                            "Map of profile name to server definition. "
+                            "Each server uses EITHER 'ssh_command' (opaque ssh invocation) "
+                            "OR 'host'+'port'+'username' (paramiko-native connection). "
+                            "'auth' is always required."
+                        ),
+                        "additionalProperties": {
+                            "type": "object",
+                            "properties": {
+                                "ssh_command": {
+                                    "type": "string",
+                                    "description": "Full ssh command, e.g. 'ssh -p 22 user@host'. Mutually exclusive with host/port/username.",
+                                },
+                                "host": {"type": "string"},
+                                "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+                                "username": {"type": "string"},
+                                "auth": {
+                                    "type": "object",
+                                    "required": ["type"],
+                                    "properties": {
+                                        "type": {
+                                            "type": "string",
+                                            "enum": ["password", "key"],
+                                            "description": "'password': authenticate with password/password_env. 'key': authenticate with private key file.",
+                                        },
+                                        "password": {"type": ["string", "null"], "description": "Plaintext password (prefer password_env for security)."},
+                                        "password_env": {"type": ["string", "null"], "description": "Environment variable name that holds the password."},
+                                        "private_key_path": {"type": ["string", "null"], "description": "Path to private key file, e.g. '~/.ssh/id_rsa'."},
+                                        "private_key_passphrase_env": {"type": ["string", "null"], "description": "Env var holding the passphrase for the private key."},
+                                        "allow_agent": {"type": "boolean", "description": "Allow SSH agent forwarding (default true)."},
+                                        "look_for_keys": {"type": "boolean", "description": "Auto-discover private keys in ~/.ssh (default true)."},
+                                    },
+                                    "additionalProperties": False,
+                                },
+                                "proxy_command": {"type": ["string", "null"], "description": "ProxyCommand for connecting through a jump host."},
+                                "shell": {"type": ["string", "null"], "description": "Override default_shell for this server, e.g. 'bash -lc'."},
+                                "command_prefix": {"type": ["string", "null"], "description": "String prepended to every command on this server."},
+                            },
+                            "additionalProperties": False,
+                        },
+                    },
+                    "defaults": {
+                        "type": "object",
+                        "description": "Optional global defaults. All fields have sensible built-in values when omitted.",
+                        "additionalProperties": False,
+                        "properties": {
+                            "connect_timeout_sec": {"type": "number", "description": "TCP connect timeout in seconds (default 10)."},
+                            "command_timeout_sec": {"type": "number", "description": "Per-command execution timeout in seconds (default 120)."},
+                            "max_stdout_bytes": {"type": "integer", "description": "Max stdout capture size in bytes (default 10485760 = 10 MiB)."},
+                            "max_stderr_bytes": {"type": "integer", "description": "Max stderr capture size in bytes (default 10485760 = 10 MiB)."},
+                            "known_hosts_policy": {"type": "string", "enum": ["strict", "accept_new"], "description": "'strict' (default): reject unknown hosts. 'accept_new': auto-accept new host keys."},
+                            "known_hosts_path": {"type": ["string", "null"], "description": "Path to known_hosts file (default '~/.ssh/known_hosts'). null disables host key checking."},
+                            "default_shell": {"type": ["string", "null"], "description": "Shell wrapper for commands (default 'bash -lc'). null sends raw commands."},
+                        },
+                    },
+                    "config_path": {
+                        "type": ["string", "null"],
+                        "description": "Where to write the config file. Default: platform user config dir (e.g. %APPDATA%/sshoc/ on Windows, ~/.config/sshoc/ on Linux).",
+                    },
+                    "overwrite": {
+                        "type": "boolean",
+                        "description": "If true, overwrite an existing config file. Default false (error if file exists).",
+                    },
+                },
+            },
+            "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+        },
         {
             "name": "ssh.list_profiles",
             "description": "List server profiles configured in sshoc.config.json",
@@ -229,9 +327,81 @@ def _result_text_block(text: str) -> list[dict[str, Any]]:
     return [{"type": "text", "text": text}]
 
 
-def _call_tool(cfg_path: str, *, tool_name: str, args: dict[str, Any] | None) -> dict[str, Any]:
-    cfg = load_config(cfg_path)
+_DEFAULT_DEFAULTS: dict[str, Any] = {
+    "connect_timeout_sec": 10,
+    "command_timeout_sec": 120,
+    "max_stdout_bytes": 10485760,
+    "max_stderr_bytes": 10485760,
+    "known_hosts_policy": "strict",
+    "known_hosts_path": "~/.ssh/known_hosts",
+    "default_shell": "bash -lc",
+}
+
+
+def _call_tool(state: _ServerState, *, tool_name: str, args: dict[str, Any] | None) -> dict[str, Any]:
     args = {} if args is None else args
+
+    # --- ssh.init_config: works without existing config ---
+    if tool_name == "ssh.init_config":
+        servers_raw = args.get("servers")
+        if not isinstance(servers_raw, dict) or not servers_raw:
+            raise ValueError("ssh.init_config requires a non-empty 'servers' object")
+        defaults_raw = args.get("defaults")
+        if defaults_raw is not None and not isinstance(defaults_raw, dict):
+            raise ValueError("'defaults' must be an object")
+        merged_defaults = {**_DEFAULT_DEFAULTS, **(defaults_raw or {})}
+        config_dict: dict[str, Any] = {
+            "schema_version": 1,
+            "defaults": merged_defaults,
+            "servers": servers_raw,
+        }
+        # Validate before writing.
+        config_from_dict(config_dict)
+
+        raw_path = args.get("config_path")
+        if raw_path is not None and not isinstance(raw_path, str):
+            raise ValueError("config_path must be a string or null")
+        if isinstance(raw_path, str) and raw_path:
+            dest = Path(raw_path).expanduser().resolve()
+        else:
+            dest = default_user_config_path()
+
+        overwrite = args.get("overwrite", False)
+        if not isinstance(overwrite, bool):
+            raise ValueError("overwrite must be a boolean")
+        if dest.exists() and not overwrite:
+            return _tool_error(
+                code="CONFIG_ALREADY_EXISTS",
+                message=f"Config file already exists at {dest}. Set overwrite=true to replace it.",
+                details={"config_path": str(dest)},
+            )
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(json.dumps(config_dict, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        state.cfg_path = str(dest)
+
+        structured = {"created": str(dest), "profiles": list(servers_raw.keys())}
+        return {
+            "content": _result_text_block(json.dumps(structured, ensure_ascii=False, indent=2)),
+            "structuredContent": structured,
+            "isError": False,
+        }
+
+    # --- No-config guard ---
+    if state.cfg_path is None and tool_name not in _NO_CONFIG_TOOLS:
+        return _tool_error(
+            code="CONFIG_NOT_FOUND",
+            message=(
+                "No sshoc.config.json found. "
+                "Call ssh.init_config to create one, or set the SSHOC_CONFIG environment variable."
+            ),
+            suggested_fixes=[{
+                "tool": "ssh.init_config",
+                "note": "Create a config file with at least one server profile.",
+            }],
+        )
+
+    cfg = load_config(state.cfg_path) if state.cfg_path is not None else None
 
     if tool_name == "ssh.list_profiles":
         profiles = [
@@ -254,6 +424,8 @@ def _call_tool(cfg_path: str, *, tool_name: str, args: dict[str, Any] | None) ->
         if profile is not None:
             if not isinstance(profile, str):
                 raise ValueError("profile must be a string")
+            if cfg is None:
+                raise ValueError("ssh.scan_host_key with 'profile' requires a config file; call ssh.init_config first or pass 'host' directly")
             host, port, profile_proxy = _server_from_profile(cfg, profile)
             if proxy_command is None:
                 proxy_command = profile_proxy
@@ -778,7 +950,8 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write(f"unknown arg: {argv[0]}\\n")
             return 2
 
-    cfg_path = str(resolve_default_config_path(cli_path=config_path))
+    cfg_info = resolve_config_path_info(cli_path=config_path)
+    state = _ServerState(cfg_path=str(cfg_info.path) if cfg_info.exists else None)
 
     initialized = False
     for line in sys.stdin:
@@ -818,7 +991,7 @@ def main(argv: list[str] | None = None) -> int:
                     "protocolVersion": negotiated,
                     "capabilities": {"tools": {"listChanged": False}},
                     "serverInfo": {"name": "sshoc", "version": __version__},
-                    "instructions": "Use tools/list then tools/call. Tools include ssh.run / ssh.upload / ssh.download and host key helpers (ssh.scan_host_key / ssh.ensure_known_host).",
+                    "instructions": "Use tools/list then tools/call. If no config file exists yet, call ssh.init_config first to create one. Tools include ssh.run / ssh.upload / ssh.download and host key helpers (ssh.scan_host_key / ssh.ensure_known_host).",
                 }
 
             write_message(safe_call(_handle_init, request_id=request_id, debug=debug))
@@ -868,7 +1041,7 @@ def main(argv: list[str] | None = None) -> int:
                 arguments = params.get("arguments")
                 if arguments is not None and not isinstance(arguments, dict):
                     raise ValueError("tools/call arguments must be object")
-                return _call_tool(cfg_path, tool_name=name, args=arguments)
+                return _call_tool(state, tool_name=name, args=arguments)
 
             write_message(safe_call(_handle_call, request_id=request_id, debug=debug))
             continue

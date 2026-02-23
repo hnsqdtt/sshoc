@@ -160,6 +160,7 @@ sshoc-mcp
 
 Tools:
 
+- `ssh.init_config` — create `sshoc.config.json` (call this first if no config exists; the AI can self-configure)
 - `ssh.list_profiles`
 - `ssh.scan_host_key`
 - `ssh.is_known_host`
@@ -168,6 +169,8 @@ Tools:
 - `ssh.run`
 - `ssh.upload`
 - `ssh.download`
+
+> Zero-config startup: `sshoc-mcp` starts even without a config file. Tools that need a config will return a `CONFIG_NOT_FOUND` error with a suggestion to call `ssh.init_config`. This lets MCP clients (e.g. AI assistants) discover the tools first, then create the config on demand.
 
 ### Generic stdio config blueprint (for MCP clients)
 
@@ -178,18 +181,16 @@ Different MCP clients may use different config formats, but the essentials are u
   "mcpServers": {
     "sshoc": {
       "command": "sshoc-mcp",
-      "args": ["--config", "<ABS_CONFIG_PATH>"],
+      // args/env are optional; the AI can call ssh.init_config to create the config.
+      // If you prefer to pin a config file, use:
+      // "args": ["--config", "<ABS_CONFIG_PATH>"],
       "env": {
         "SSHOC_DEMO_PASSWORD": "your_password",
         "SSHOC_DEBUG": "0"
-      },
-      "cwd": "<OPTIONAL_WORKDIR>"
+      }
     }
   }
 }
-// Examples for <ABS_CONFIG_PATH>:
-// - macOS/Linux: /path/to/sshoc.config.json
-// - Windows: C:\\path\\to\\sshoc.config.json
 ```
 
 ---
