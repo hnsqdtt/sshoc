@@ -62,8 +62,13 @@ def _tool_error(
     if suggested_fixes:
         err["suggestedFixes"] = suggested_fixes
     structured = {"error": err}
+    # Slim text for LLM: just code + message + suggested tool names.
+    parts = [f"ERROR {code}: {message}"]
+    if suggested_fixes:
+        tools = ", ".join(f.get("tool", "?") for f in suggested_fixes)
+        parts.append(f"suggested: {tools}")
     return {
-        "content": _result_text_block(json.dumps(structured, ensure_ascii=False, indent=2)),
+        "content": _result_text_block("\n".join(parts)),
         "structuredContent": structured,
         "isError": True,
     }
@@ -327,6 +332,20 @@ def _result_text_block(text: str) -> list[dict[str, Any]]:
     return [{"type": "text", "text": text}]
 
 
+def _ok(structured: dict[str, Any], slim_text: str) -> dict[str, Any]:
+    """Return a success result with slim text content for LLM and full structuredContent."""
+    return {
+        "content": _result_text_block(slim_text),
+        "structuredContent": structured,
+        "isError": False,
+    }
+
+
+def _slim_host_key(hk: dict[str, Any]) -> str:
+    """One-line summary of a host key for LLM consumption."""
+    return f"{hk.get('key_type', '?')} {hk.get('fingerprint_sha256', '?')}"
+
+
 _DEFAULT_DEFAULTS: dict[str, Any] = {
     "connect_timeout_sec": 10,
     "command_timeout_sec": 120,
@@ -381,11 +400,8 @@ def _call_tool(state: _ServerState, *, tool_name: str, args: dict[str, Any] | No
         state.cfg_path = str(dest)
 
         structured = {"created": str(dest), "profiles": list(servers_raw.keys())}
-        return {
-            "content": _result_text_block(json.dumps(structured, ensure_ascii=False, indent=2)),
-            "structuredContent": structured,
-            "isError": False,
-        }
+        slim = f"Config created: {dest}\nProfiles: {', '.join(servers_raw.keys())}"
+        return _ok(structured, slim)
 
     # --- No-config guard ---
     if state.cfg_path is None and tool_name not in _NO_CONFIG_TOOLS:
@@ -408,11 +424,8 @@ def _call_tool(state: _ServerState, *, tool_name: str, args: dict[str, Any] | No
             {"profile": name, "host": srv.host, "port": srv.port, "username": srv.username}
             for name, srv in sorted(cfg.servers.items(), key=lambda kv: kv[0])
         ]
-        return {
-            "content": _result_text_block(json.dumps({"profiles": profiles}, ensure_ascii=False, indent=2)),
-            "structuredContent": {"profiles": profiles},
-            "isError": False,
-        }
+        slim_lines = [f"  {p['profile']}: {p['username']}@{p['host']}:{p['port']}" for p in profiles]
+        return _ok({"profiles": profiles}, "Profiles:\n" + "\n".join(slim_lines))
 
     if tool_name == "ssh.scan_host_key":
         profile = args.get("profile")
@@ -453,11 +466,8 @@ def _call_tool(state: _ServerState, *, tool_name: str, args: dict[str, Any] | No
         structured: dict[str, Any] = {"host_key": info.to_dict()}
         if isinstance(profile, str):
             structured["profile"] = profile
-        return {
-            "content": _result_text_block(json.dumps(structured, ensure_ascii=False, indent=2)),
-            "structuredContent": structured,
-            "isError": False,
-        }
+        slim = _slim_host_key(info.to_dict())
+        return _ok(structured, f"Host key: {slim}")
 
     if tool_name == "ssh.is_known_host":
         profile = args.get("profile")
@@ -495,11 +505,9 @@ def _call_tool(state: _ServerState, *, tool_name: str, args: dict[str, Any] | No
         }
         if isinstance(profile, str):
             structured["profile"] = profile
-        return {
-            "content": _result_text_block(json.dumps(structured, ensure_ascii=False, indent=2)),
-            "structuredContent": structured,
-            "isError": False,
-        }
+        status = "known" if entries else "not found"
+        slim = f"Host {structured['host_id']}: {status}"
+        return _ok(structured, slim)
 
     if tool_name == "ssh.add_known_host":
         profile = args.get("profile")
@@ -546,11 +554,9 @@ def _call_tool(state: _ServerState, *, tool_name: str, args: dict[str, Any] | No
                 details={"profile": profile, "host": host, "port": port, "known_hosts_path": known_hosts_path},
             )
 
-        return {
-            "content": _result_text_block(json.dumps(structured, ensure_ascii=False, indent=2)),
-            "structuredContent": structured,
-            "isError": False,
-        }
+        action = structured.get("action", "done")
+        slim = f"Host key {action} in {structured.get('known_hosts_path', known_hosts_path)}"
+        return _ok(structured, slim)
 
     if tool_name == "ssh.ensure_known_host":
         profile = args.get("profile")
@@ -621,11 +627,9 @@ def _call_tool(state: _ServerState, *, tool_name: str, args: dict[str, Any] | No
                 suggested_fixes=fixes or None,
             )
 
-        return {
-            "content": _result_text_block(json.dumps(structured, ensure_ascii=False, indent=2)),
-            "structuredContent": structured,
-            "isError": False,
-        }
+        status = structured.get("status", "done")
+        slim = f"Host key: {status} ({structured.get('known_hosts_path', known_hosts_path)})"
+        return _ok(structured, slim)
 
     if tool_name == "ssh.run":
         profile = args.get("profile")
@@ -664,7 +668,6 @@ def _call_tool(state: _ServerState, *, tool_name: str, args: dict[str, Any] | No
             "cwd": cwd,
             "env": env,
             "use_pty": use_pty,
-            "report_host_key": True,
         }
         if known_hosts_policy is not None:
             run_kwargs["known_hosts_policy"] = known_hosts_policy
@@ -747,11 +750,15 @@ def _call_tool(state: _ServerState, *, tool_name: str, args: dict[str, Any] | No
         except Exception as exc:
             return _tool_error(code="RUN_FAILED", message=f"{type(exc).__name__}: {exc}", details={"profile": profile})
 
-        return {
-            "content": _result_text_block(json.dumps(structured, ensure_ascii=False, indent=2)),
-            "structuredContent": structured,
-            "isError": False,
-        }
+        # Slim content for LLM: only exit_code, stdout, stderr (if non-empty).
+        slim_parts = [f"exit_code: {structured['exit_code']}"]
+        stdout = structured.get("stdout", "")
+        stderr = structured.get("stderr", "")
+        if stdout:
+            slim_parts.append(f"stdout:\n{stdout}")
+        if stderr:
+            slim_parts.append(f"stderr:\n{stderr}")
+        return _ok(structured, "\n".join(slim_parts))
 
     if tool_name == "ssh.upload":
         profile = args.get("profile")
@@ -771,7 +778,7 @@ def _call_tool(state: _ServerState, *, tool_name: str, args: dict[str, Any] | No
         if expected_host_key_fingerprint is not None and not isinstance(expected_host_key_fingerprint, str):
             raise ValueError("expected_host_key_fingerprint must be a string")
         client = build_client(cfg, profile)
-        upload_kwargs: dict[str, Any] = {"overwrite": overwrite, "report_host_key": True}
+        upload_kwargs: dict[str, Any] = {"overwrite": overwrite}
         if known_hosts_policy is not None:
             upload_kwargs["known_hosts_policy"] = known_hosts_policy
         if has_known_hosts_path_override:
@@ -832,11 +839,8 @@ def _call_tool(state: _ServerState, *, tool_name: str, args: dict[str, Any] | No
             return _tool_error(code="SSH_ERROR", message=f"{type(exc).__name__}: {exc}", details={"profile": profile})
         except Exception as exc:
             return _tool_error(code="UPLOAD_FAILED", message=f"{type(exc).__name__}: {exc}", details={"profile": profile})
-        return {
-            "content": _result_text_block(json.dumps(structured, ensure_ascii=False, indent=2)),
-            "structuredContent": structured,
-            "isError": False,
-        }
+        slim = f"Uploaded {local_path} -> {profile}:{remote_path}"
+        return _ok(structured, slim)
 
     if tool_name == "ssh.download":
         profile = args.get("profile")
@@ -858,7 +862,7 @@ def _call_tool(state: _ServerState, *, tool_name: str, args: dict[str, Any] | No
         if expected_host_key_fingerprint is not None and not isinstance(expected_host_key_fingerprint, str):
             raise ValueError("expected_host_key_fingerprint must be a string")
         client = build_client(cfg, profile)
-        dl_kwargs: dict[str, Any] = {"overwrite": overwrite, "report_host_key": True}
+        dl_kwargs: dict[str, Any] = {"overwrite": overwrite}
         if known_hosts_policy is not None:
             dl_kwargs["known_hosts_policy"] = known_hosts_policy
         if has_known_hosts_path_override:
@@ -919,11 +923,8 @@ def _call_tool(state: _ServerState, *, tool_name: str, args: dict[str, Any] | No
             return _tool_error(code="SSH_ERROR", message=f"{type(exc).__name__}: {exc}", details={"profile": profile})
         except Exception as exc:
             return _tool_error(code="DOWNLOAD_FAILED", message=f"{type(exc).__name__}: {exc}", details={"profile": profile})
-        return {
-            "content": _result_text_block(json.dumps(structured, ensure_ascii=False, indent=2)),
-            "structuredContent": structured,
-            "isError": False,
-        }
+        slim = f"Downloaded {profile}:{remote_path} -> {local_path}"
+        return _ok(structured, slim)
 
     return {
         "content": _result_text_block(f"unknown tool: {tool_name}"),
