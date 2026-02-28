@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import os
 import shlex
+import threading
 import time
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Literal
 
 import paramiko
 
@@ -45,6 +46,76 @@ class RunResult:
             d["host_key"] = self.host_key
             d["host_key_added"] = bool(self.host_key_added)
             d["known_hosts_path"] = self.known_hosts_path
+        return d
+
+
+TaskStatus = Literal["running", "completed", "failed", "killed", "timeout"]
+
+
+@dataclass
+class AsyncTask:
+    """Mutable state for one background SSH command execution."""
+
+    task_id: str
+    profile: str
+    command: str
+    status: TaskStatus = "running"
+    exit_code: int | None = None
+    error: str | None = None
+    duration_ms: int | None = None
+    started_at: float = field(default_factory=time.monotonic)
+
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _stdout_buf: bytearray = field(default_factory=bytearray, repr=False)
+    _stderr_buf: bytearray = field(default_factory=bytearray, repr=False)
+    _channel: paramiko.Channel | None = field(default=None, repr=False)
+    _client: paramiko.SSHClient | None = field(default=None, repr=False)
+    _thread: threading.Thread | None = field(default=None, repr=False)
+    _kill_requested: bool = field(default=False, repr=False)
+
+    def append_stdout(self, data: bytes) -> int:
+        with self._lock:
+            self._stdout_buf += data
+            return len(self._stdout_buf)
+
+    def append_stderr(self, data: bytes) -> int:
+        with self._lock:
+            self._stderr_buf += data
+            return len(self._stderr_buf)
+
+    def get_stdout(self) -> str:
+        with self._lock:
+            return bytes(self._stdout_buf).decode("utf-8", errors="replace")
+
+    def get_stderr(self) -> str:
+        with self._lock:
+            return bytes(self._stderr_buf).decode("utf-8", errors="replace")
+
+    def get_stdout_bytes(self) -> int:
+        with self._lock:
+            return len(self._stdout_buf)
+
+    def get_stderr_bytes(self) -> int:
+        with self._lock:
+            return len(self._stderr_buf)
+
+    def to_status_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "task_id": self.task_id,
+            "profile": self.profile,
+            "command": self.command,
+            "status": self.status,
+        }
+        if self.exit_code is not None:
+            d["exit_code"] = self.exit_code
+        if self.error is not None:
+            d["error"] = self.error
+        if self.duration_ms is not None:
+            d["duration_ms"] = self.duration_ms
+        d["stdout"] = self.get_stdout()
+        d["stderr"] = self.get_stderr()
+        d["stdout_bytes"] = self.get_stdout_bytes()
+        d["stderr_bytes"] = self.get_stderr_bytes()
         return d
 
 
@@ -206,6 +277,99 @@ class SSHClient:
             host_key_added=hk_added if report_host_key else None,
             known_hosts_path=kh_path if report_host_key else None,
         )
+
+    def run_async_worker(
+        self,
+        task: AsyncTask,
+        *,
+        timeout_sec: float | None = None,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        use_pty: bool = False,
+        known_hosts_policy: KnownHostsPolicy | None = None,
+        known_hosts_path: str | None | object = _UNSET,
+        expected_host_key_fingerprint: str | None = None,
+    ) -> None:
+        """Worker function for daemon thread. Updates *task* in place."""
+        try:
+            inner = _build_inner_command(
+                raw_command=task.command,
+                cwd=cwd,
+                env=env,
+                command_prefix=self._server.command_prefix,
+            )
+            final = _wrap_with_shell(shell=self._server.shell, inner=inner)
+
+            max_out = self._defaults.max_stdout_bytes
+            max_err = self._defaults.max_stderr_bytes
+
+            client, _hk_info, _hk_added, _kh_path = self._connect(
+                known_hosts_policy=known_hosts_policy,
+                known_hosts_path=known_hosts_path,
+                expected_host_key_fingerprint=expected_host_key_fingerprint,
+            )
+            task._client = client
+            try:
+                transport = client.get_transport()
+                if transport is None:
+                    raise RuntimeError("paramiko transport is None (unexpected)")
+
+                channel = transport.open_session(timeout=self._defaults.connect_timeout_sec)
+                task._channel = channel
+                if use_pty:
+                    channel.get_pty()
+                channel.exec_command(final)
+
+                while True:
+                    if task._kill_requested:
+                        channel.close()
+                        task.duration_ms = int((time.monotonic() - task.started_at) * 1000)
+                        task.status = "killed"
+                        return
+
+                    if channel.recv_ready():
+                        data = channel.recv(32768)
+                        if data:
+                            cur = task.append_stdout(data)
+                            if cur > max_out:
+                                channel.close()
+                                task.error = f"stdout exceeded {max_out} bytes"
+                                task.duration_ms = int((time.monotonic() - task.started_at) * 1000)
+                                task.status = "failed"
+                                return
+
+                    if channel.recv_stderr_ready():
+                        data = channel.recv_stderr(32768)
+                        if data:
+                            cur = task.append_stderr(data)
+                            if cur > max_err:
+                                channel.close()
+                                task.error = f"stderr exceeded {max_err} bytes"
+                                task.duration_ms = int((time.monotonic() - task.started_at) * 1000)
+                                task.status = "failed"
+                                return
+
+                    if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
+                        break
+
+                    if timeout_sec is not None and (time.monotonic() - task.started_at) > timeout_sec:
+                        channel.close()
+                        task.error = f"command timed out after {timeout_sec} sec"
+                        task.duration_ms = int((time.monotonic() - task.started_at) * 1000)
+                        task.status = "timeout"
+                        return
+
+                    time.sleep(0.01)
+
+                task.exit_code = channel.recv_exit_status()
+                task.duration_ms = int((time.monotonic() - task.started_at) * 1000)
+                task.status = "completed"
+            finally:
+                client.close()
+        except Exception as exc:
+            task.error = f"{type(exc).__name__}: {exc}"
+            task.duration_ms = int((time.monotonic() - task.started_at) * 1000)
+            task.status = "failed"
 
     def upload(
         self,

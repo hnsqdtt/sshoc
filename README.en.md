@@ -166,11 +166,28 @@ Tools:
 - `ssh.is_known_host`
 - `ssh.add_known_host`
 - `ssh.ensure_known_host`
-- `ssh.run`
+- `ssh.run` — run a command synchronously (blocks until done, default 120s timeout)
 - `ssh.upload`
 - `ssh.download`
+- `ssh.run_async` — submit a command for background execution, returns a `task_id` immediately (ideal for long-running tasks)
+- `ssh.task_status` — query the status and output of a background task
+- `ssh.task_kill` — terminate a running background task
 
 > Zero-config startup: `sshoc-mcp` starts even without a config file. Tools that need a config will return a `CONFIG_NOT_FOUND` error with a suggestion to call `ssh.init_config`. This lets MCP clients (e.g. AI assistants) discover the tools first, then create the config on demand.
+
+### Background tasks (v0.2.0+)
+
+`ssh.run` is synchronous with a default 120s timeout, which is not suitable for long-running tasks (builds, deployments, training, etc.). The background task tools provide async execution:
+
+```text
+1. ssh.run_async   {profile, command}         → returns {task_id, status: "running"} immediately
+2. ssh.task_status {task_id}                   → returns {status, exit_code, stdout, stderr, ...}
+3. ssh.task_kill   {task_id}                   → terminates the task
+```
+
+- `ssh.run_async` has no timeout by default (optionally pass `timeout_sec`)
+- stdout/stderr are buffered in real time; `ssh.task_status` can read partial output while the task is still running
+- `task_id` is a session-scoped incrementing integer (`"1"`, `"2"`, ...), reset when the MCP server restarts
 
 ### Generic stdio config blueprint (for MCP clients)
 

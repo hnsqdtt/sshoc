@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +32,7 @@ from .jsonrpc import (
     safe_call,
     write_message,
 )
-from .ssh_client import build_client
+from .ssh_client import AsyncTask, build_client
 
 
 class _ServerState:
@@ -39,10 +40,25 @@ class _ServerState:
 
     def __init__(self, cfg_path: str | None) -> None:
         self.cfg_path = cfg_path
+        self._next_task_id: int = 0
+        self._tasks: dict[str, AsyncTask] = {}
+        self._tasks_lock = threading.Lock()
+
+    def create_task(self, profile: str, command: str) -> AsyncTask:
+        with self._tasks_lock:
+            self._next_task_id += 1
+            tid = str(self._next_task_id)
+            task = AsyncTask(task_id=tid, profile=profile, command=command)
+            self._tasks[tid] = task
+            return task
+
+    def get_task(self, task_id: str) -> AsyncTask | None:
+        with self._tasks_lock:
+            return self._tasks.get(task_id)
 
 
 # Tools that work without a config file.
-_NO_CONFIG_TOOLS = frozenset({"ssh.init_config", "ssh.scan_host_key"})
+_NO_CONFIG_TOOLS = frozenset({"ssh.init_config", "ssh.scan_host_key", "ssh.task_status", "ssh.task_kill"})
 
 
 LATEST_PROTOCOL_VERSION = "2025-11-25"
@@ -324,6 +340,101 @@ def _tool_list() -> list[dict[str, Any]]:
                 },
             },
             "annotations": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True},
+        },
+        {
+            "name": "ssh.run_async",
+            "description": (
+                "Submit a command for background execution on a remote server via SSH. "
+                "Returns a task_id immediately. Use ssh.task_status to poll for results and ssh.task_kill to terminate."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["profile", "command"],
+                "properties": {
+                    "profile": {"type": "string"},
+                    "command": {"type": "string"},
+                    "timeout_sec": {
+                        "type": "number",
+                        "description": "Optional timeout in seconds. Default: no timeout (runs until completion).",
+                    },
+                    "cwd": {"type": "string"},
+                    "env": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "use_pty": {"type": "boolean"},
+                    "known_hosts_policy": {"type": "string", "enum": ["strict", "accept_new"]},
+                    "known_hosts_path": {"type": ["string", "null"]},
+                    "expected_host_key_fingerprint": {"type": "string"},
+                },
+            },
+            "outputSchema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["task_id", "profile", "command", "status"],
+                "properties": {
+                    "task_id": {"type": "string"},
+                    "profile": {"type": "string"},
+                    "command": {"type": "string"},
+                    "status": {"type": "string", "enum": ["running"]},
+                },
+            },
+            "annotations": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True},
+        },
+        {
+            "name": "ssh.task_status",
+            "description": (
+                "Query the status and output of a background SSH task by task_id. "
+                "Returns current status, exit code (if finished), and accumulated stdout/stderr."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["task_id"],
+                "properties": {
+                    "task_id": {"type": "string"},
+                },
+            },
+            "outputSchema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["task_id", "profile", "command", "status", "stdout", "stderr"],
+                "properties": {
+                    "task_id": {"type": "string"},
+                    "profile": {"type": "string"},
+                    "command": {"type": "string"},
+                    "status": {"type": "string", "enum": ["running", "completed", "failed", "killed", "timeout"]},
+                    "exit_code": {"type": "integer"},
+                    "error": {"type": "string"},
+                    "duration_ms": {"type": "integer"},
+                    "stdout": {"type": "string"},
+                    "stderr": {"type": "string"},
+                    "stdout_bytes": {"type": "integer"},
+                    "stderr_bytes": {"type": "integer"},
+                },
+            },
+            "annotations": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
+        },
+        {
+            "name": "ssh.task_kill",
+            "description": "Terminate a running background SSH task by task_id",
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["task_id"],
+                "properties": {
+                    "task_id": {"type": "string"},
+                },
+            },
+            "outputSchema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["task_id", "status"],
+                "properties": {
+                    "task_id": {"type": "string"},
+                    "status": {"type": "string"},
+                    "message": {"type": "string"},
+                },
+            },
+            "annotations": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
         },
     ]
 
@@ -924,6 +1035,137 @@ def _call_tool(state: _ServerState, *, tool_name: str, args: dict[str, Any] | No
         except Exception as exc:
             return _tool_error(code="DOWNLOAD_FAILED", message=f"{type(exc).__name__}: {exc}", details={"profile": profile})
         slim = f"Downloaded {profile}:{remote_path} -> {local_path}"
+        return _ok(structured, slim)
+
+    if tool_name == "ssh.run_async":
+        profile = args.get("profile")
+        command = args.get("command")
+        if not isinstance(profile, str) or not isinstance(command, str):
+            raise ValueError("ssh.run_async requires string args: profile, command")
+        timeout_sec = args.get("timeout_sec")
+        cwd = args.get("cwd")
+        env = args.get("env")
+        use_pty = args.get("use_pty", False)
+        known_hosts_policy = args.get("known_hosts_policy")
+        known_hosts_path = args.get("known_hosts_path") if "known_hosts_path" in args else None
+        has_known_hosts_path_override = "known_hosts_path" in args
+        expected_host_key_fingerprint = args.get("expected_host_key_fingerprint")
+
+        if timeout_sec is not None and not isinstance(timeout_sec, (int, float)):
+            raise ValueError("timeout_sec must be a number")
+        if cwd is not None and not isinstance(cwd, str):
+            raise ValueError("cwd must be a string")
+        if env is not None and not (
+            isinstance(env, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in env.items())
+        ):
+            raise ValueError("env must be an object of string->string")
+        if not isinstance(use_pty, bool):
+            raise ValueError("use_pty must be a boolean")
+        if known_hosts_policy is not None and not isinstance(known_hosts_policy, str):
+            raise ValueError("known_hosts_policy must be a string")
+        if has_known_hosts_path_override and known_hosts_path is not None and not isinstance(known_hosts_path, str):
+            raise ValueError("known_hosts_path must be a string or null")
+        if expected_host_key_fingerprint is not None and not isinstance(expected_host_key_fingerprint, str):
+            raise ValueError("expected_host_key_fingerprint must be a string")
+
+        ssh_client = build_client(cfg, profile)
+        task = state.create_task(profile=profile, command=command)
+
+        run_kwargs: dict[str, Any] = {
+            "timeout_sec": float(timeout_sec) if timeout_sec is not None else None,
+            "cwd": cwd,
+            "env": env,
+            "use_pty": use_pty,
+        }
+        if known_hosts_policy is not None:
+            run_kwargs["known_hosts_policy"] = known_hosts_policy
+        if has_known_hosts_path_override:
+            run_kwargs["known_hosts_path"] = known_hosts_path
+        if expected_host_key_fingerprint is not None:
+            run_kwargs["expected_host_key_fingerprint"] = expected_host_key_fingerprint
+
+        thread = threading.Thread(
+            target=ssh_client.run_async_worker,
+            args=(task,),
+            kwargs=run_kwargs,
+            daemon=True,
+            name=f"sshoc-task-{task.task_id}",
+        )
+        task._thread = thread
+        thread.start()
+
+        structured = {
+            "task_id": task.task_id,
+            "profile": profile,
+            "command": command,
+            "status": "running",
+        }
+        slim = f"Task {task.task_id} started: {command[:80]}"
+        return _ok(structured, slim)
+
+    if tool_name == "ssh.task_status":
+        task_id = args.get("task_id")
+        if not isinstance(task_id, str):
+            raise ValueError("ssh.task_status requires string arg: task_id")
+
+        task = state.get_task(task_id)
+        if task is None:
+            return _tool_error(
+                code="TASK_NOT_FOUND",
+                message=f"No task with id={task_id!r}",
+                details={"task_id": task_id},
+            )
+
+        structured = task.to_status_dict()
+        slim_parts = [f"task_id: {task_id}", f"status: {task.status}"]
+        if task.exit_code is not None:
+            slim_parts.append(f"exit_code: {task.exit_code}")
+        if task.error:
+            slim_parts.append(f"error: {task.error}")
+        stdout = task.get_stdout()
+        stderr = task.get_stderr()
+        if stdout:
+            slim_parts.append(f"stdout:\n{stdout}")
+        if stderr:
+            slim_parts.append(f"stderr:\n{stderr}")
+        return _ok(structured, "\n".join(slim_parts))
+
+    if tool_name == "ssh.task_kill":
+        task_id = args.get("task_id")
+        if not isinstance(task_id, str):
+            raise ValueError("ssh.task_kill requires string arg: task_id")
+
+        task = state.get_task(task_id)
+        if task is None:
+            return _tool_error(
+                code="TASK_NOT_FOUND",
+                message=f"No task with id={task_id!r}",
+                details={"task_id": task_id},
+            )
+
+        if task.status != "running":
+            structured = {
+                "task_id": task_id,
+                "status": task.status,
+                "message": f"Task already {task.status}; nothing to kill.",
+            }
+            slim = f"Task {task_id}: already {task.status}"
+            return _ok(structured, slim)
+
+        task._kill_requested = True
+        channel = task._channel
+        if channel is not None:
+            try:
+                channel.close()
+            except Exception:
+                pass
+
+        structured = {
+            "task_id": task_id,
+            "status": "killed",
+            "message": "Kill signal sent. Task will terminate shortly.",
+        }
+        slim = f"Task {task_id}: kill signal sent"
         return _ok(structured, slim)
 
     return {

@@ -166,11 +166,28 @@ sshoc-mcp
 - `ssh.is_known_host`
 - `ssh.add_known_host`
 - `ssh.ensure_known_host`
-- `ssh.run`
+- `ssh.run` — 同步执行命令（阻塞直到完成，默认 120 秒超时）
 - `ssh.upload`
 - `ssh.download`
+- `ssh.run_async` — 提交命令后台执行，立即返回 `task_id`（适合长时间运行的任务）
+- `ssh.task_status` — 查询后台任务的状态和输出
+- `ssh.task_kill` — 终止正在运行的后台任务
 
 > 零配置启动：`sshoc-mcp` 即使没有配置文件也能正常启动。需要配置的工具会返回 `CONFIG_NOT_FOUND` 错误并建议调用 `ssh.init_config`。这样 MCP 客户端（如 AI 助手）可以先发现工具，再按需创建配置。
+
+### 后台任务（v0.2.0+）
+
+`ssh.run` 是同步的，默认 120 秒超时，不适合长时间运行的任务（编译、部署、训练等）。后台任务工具提供了异步执行能力：
+
+```text
+1. ssh.run_async  {profile, command}         → 立即返回 {task_id, status: "running"}
+2. ssh.task_status {task_id}                  → 返回 {status, exit_code, stdout, stderr, ...}
+3. ssh.task_kill   {task_id}                  → 终止任务
+```
+
+- `ssh.run_async` 默认无超时（可选传 `timeout_sec`）
+- 后台任务的 stdout/stderr 实时缓冲，可通过 `ssh.task_status` 随时查看（包括运行中的部分输出）
+- `task_id` 为会话级递增整数（`"1"`, `"2"`, ...），MCP server 重启后重置
 
 ### 通用 stdio 配置蓝图（供 MCP 客户端参考）
 
