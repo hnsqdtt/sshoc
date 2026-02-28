@@ -264,8 +264,8 @@ class SSHClient:
             client.close()
 
         duration_ms = int((time.monotonic() - start) * 1000)
-        stdout = bytes(stdout_b).decode("utf-8")
-        stderr = bytes(stderr_b).decode("utf-8")
+        stdout = bytes(stdout_b).decode("utf-8", errors="replace")
+        stderr = bytes(stderr_b).decode("utf-8", errors="replace")
         return RunResult(
             profile=self._profile,
             command=command,

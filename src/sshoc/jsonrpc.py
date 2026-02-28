@@ -32,8 +32,17 @@ def read_messages(stream: Iterable[str]) -> Iterable[Json]:
         yield json.loads(line)
 
 
+def _strip_surrogates(s: str) -> str:
+    """Replace lone surrogates (U+D800-U+DFFF) so JSON serialisation never fails."""
+    return s.encode("utf-8", errors="replace").decode("utf-8")
+
+
 def write_message(msg: Json) -> None:
-    sys.stdout.write(json.dumps(msg, ensure_ascii=False) + "\n")
+    try:
+        text = json.dumps(msg, ensure_ascii=False)
+    except UnicodeEncodeError:
+        text = json.dumps(msg, ensure_ascii=True)
+    sys.stdout.write(text + "\n")
     sys.stdout.flush()
 
 
