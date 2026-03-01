@@ -345,7 +345,11 @@ def _tool_list() -> list[dict[str, Any]]:
             "name": "ssh.run_async",
             "description": (
                 "Submit a command for background execution on a remote server via SSH. "
-                "Returns a task_id immediately. Use ssh.task_status to poll for results and ssh.task_kill to terminate."
+                "Returns a task_id immediately. The task runs in the background — "
+                "do NOT call ssh.task_status right away. Instead, continue with other work "
+                "or inform the user the task is running. Only check ssh.task_status when "
+                "the user asks about it or after sufficient time has passed. "
+                "Use ssh.task_kill to terminate a running task."
             ),
             "inputSchema": {
                 "type": "object",
@@ -382,8 +386,10 @@ def _tool_list() -> list[dict[str, Any]]:
         {
             "name": "ssh.task_status",
             "description": (
-                "Query the status and output of a background SSH task by task_id. "
-                "Returns current status, exit code (if finished), and accumulated stdout/stderr."
+                "Check the status and output of a background SSH task by task_id. "
+                "Returns current status, exit code (if finished), and accumulated stdout/stderr. "
+                "Only call this when the user asks for task progress or when you have reason "
+                "to believe the task has had enough time to complete."
             ),
             "inputSchema": {
                 "type": "object",
