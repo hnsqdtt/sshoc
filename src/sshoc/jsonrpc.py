@@ -40,9 +40,10 @@ def _strip_surrogates(s: str) -> str:
 def write_message(msg: Json) -> None:
     try:
         text = json.dumps(msg, ensure_ascii=False)
-    except UnicodeEncodeError:
+        sys.stdout.write(text + "\n")
+    except (UnicodeEncodeError, UnicodeDecodeError):
         text = json.dumps(msg, ensure_ascii=True)
-    sys.stdout.write(text + "\n")
+        sys.stdout.write(text + "\n")
     sys.stdout.flush()
 
 

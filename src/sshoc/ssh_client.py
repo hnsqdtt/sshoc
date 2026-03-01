@@ -119,6 +119,11 @@ class AsyncTask:
         return d
 
 
+def _sanitize_str(s: str) -> str:
+    """Replace lone surrogates (U+D800-U+DFFF) so paramiko UTF-8 encoding never fails."""
+    return s.encode("utf-8", errors="replace").decode("utf-8")
+
+
 def _ensure_valid_env_key(k: str) -> None:
     if not k or not (k[0].isalpha() or k[0] == "_") or not all(c.isalnum() or c == "_" for c in k[1:]):
         raise ValueError(f"invalid env key: {k!r}")
@@ -205,6 +210,7 @@ class SSHClient:
         report_host_key: bool = False,
     ) -> RunResult:
         timeout = self._defaults.command_timeout_sec if timeout_sec is None else float(timeout_sec)
+        command = _sanitize_str(command)
 
         inner = _build_inner_command(
             raw_command=command,
@@ -292,6 +298,7 @@ class SSHClient:
     ) -> None:
         """Worker function for daemon thread. Updates *task* in place."""
         try:
+            task.command = _sanitize_str(task.command)
             inner = _build_inner_command(
                 raw_command=task.command,
                 cwd=cwd,
